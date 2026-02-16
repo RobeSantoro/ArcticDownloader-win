@@ -1248,7 +1248,10 @@ fn run_uv_pip_strict(
     }
 
     let args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
-    run_command_env(uv_bin, &args, working_dir, envs)
+    let mut merged_envs: Vec<(&str, &str)> = Vec::with_capacity(envs.len() + 1);
+    merged_envs.push(("UV_LINK_MODE", "copy"));
+    merged_envs.extend_from_slice(envs);
+    run_command_env(uv_bin, &args, working_dir, &merged_envs)
 }
 fn uv_pip_uninstall_best_effort(
     uv_bin: &str,
@@ -1326,19 +1329,28 @@ fn profile_from_torch_env(root: &Path) -> Result<String, String> {
     let torch_v = lines.next().unwrap_or_default().to_ascii_lowercase();
     let cuda_v = lines.next().unwrap_or_default().to_ascii_lowercase();
 
-    if torch_v.starts_with("2.7") && cuda_v.starts_with("12.8") {
-        return Ok("torch271_cu128".to_string());
-    }
-    if torch_v.starts_with("2.8") && cuda_v.starts_with("12.8") {
-        return Ok("torch280_cu128".to_string());
-    }
-    if torch_v.starts_with("2.9") && cuda_v.starts_with("13.0") {
-        return Ok("torch291_cu130".to_string());
+    if let Some(profile) = torch_profile_from_versions(&torch_v, &cuda_v) {
+        return Ok(profile);
     }
 
     Err(format!(
         "Unsupported installed torch/cuda combo: torch={torch_v}, cuda={cuda_v}"
     ))
+}
+
+fn torch_profile_from_versions(torch_v: &str, cuda_v: &str) -> Option<String> {
+    let t = torch_v.trim().to_ascii_lowercase();
+    let c = cuda_v.trim().to_ascii_lowercase();
+    if t.starts_with("2.7") && c.starts_with("12.8") {
+        return Some("torch271_cu128".to_string());
+    }
+    if t.starts_with("2.8") && c.starts_with("12.8") {
+        return Some("torch280_cu128".to_string());
+    }
+    if t.starts_with("2.9") && c.starts_with("13.0") {
+        return Some("torch291_cu130".to_string());
+    }
+    None
 }
 
 fn attention_wheel_url(profile: &str, backend: &str) -> Option<&'static str> {
@@ -1521,27 +1533,102 @@ fn torch_profile_to_packages(
 ) {
     match profile {
         "torch271_cu128" => (
-            "2.7.1",
-            "0.22.1",
-            "2.7.1",
+            "2.7.1+cu128",
+            "0.22.1+cu128",
+            "2.7.1+cu128",
             "https://download.pytorch.org/whl/cu128",
             "triton-windows==3.3.1.post19",
         ),
         "torch291_cu130" => (
-            "2.9.1",
-            "0.24.1",
-            "2.9.1",
+            "2.9.1+cu130",
+            "0.24.1+cu130",
+            "2.9.1+cu130",
             "https://download.pytorch.org/whl/cu130",
             "triton-windows<3.6",
         ),
         _ => (
-            "2.8.0",
-            "0.23.0",
-            "2.8.0",
+            "2.8.0+cu128",
+            "0.23.0+cu128",
+            "2.8.0+cu128",
             "https://download.pytorch.org/whl/cu128",
             "triton-windows==3.4.0.post20",
         ),
     }
+}
+
+fn reassert_torch_stack_for_profile(
+    uv_bin: &str,
+    py_path: &str,
+    root: &Path,
+    uv_python_install_dir: &str,
+    profile: &str,
+) -> Result<(), String> {
+    let (torch_v, tv_v, ta_v, index_url, triton_pkg) = torch_profile_to_packages(profile);
+    run_uv_pip_strict(
+        uv_bin,
+        py_path,
+        &[
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+            &format!("torch=={torch_v}"),
+            &format!("torchvision=={tv_v}"),
+            &format!("torchaudio=={ta_v}"),
+            "--index-url",
+            index_url,
+            "--no-cache-dir",
+            "--timeout=1000",
+            "--retries",
+            "10",
+        ],
+        Some(root),
+        &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+    )?;
+    run_uv_pip_strict(
+        uv_bin,
+        py_path,
+        &[
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+            triton_pkg,
+            "--no-cache-dir",
+            "--timeout=1000",
+            "--retries",
+            "10",
+        ],
+        Some(root),
+        &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+    )?;
+    let mut verify_cmd = std::process::Command::new(py_path);
+    verify_cmd.arg("-c").arg(
+        "import torch, importlib.metadata as m; \
+         print(getattr(torch, '__version__', '')); \
+         print(getattr(torch.version, 'cuda', '') or ''); \
+         print(m.version('torchvision')); \
+         print(m.version('torchaudio'))",
+    );
+    verify_cmd.current_dir(root);
+    apply_background_command_flags(&mut verify_cmd);
+    let verify = verify_cmd
+        .output()
+        .map_err(|err| format!("Failed to verify torch profile with {py_path}: {err}"))?;
+    if !verify.status.success() {
+        return Err("Torch profile verification command failed after reinstall.".to_string());
+    }
+    let text = String::from_utf8_lossy(&verify.stdout);
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let installed_torch = lines.next().unwrap_or_default();
+    let installed_cuda = lines.next().unwrap_or_default();
+    let installed_tv = lines.next().unwrap_or_default();
+    let installed_ta = lines.next().unwrap_or_default();
+    let actual_profile = torch_profile_from_versions(installed_torch, installed_cuda);
+    if actual_profile.as_deref() != Some(profile) {
+        return Err(format!(
+            "Torch profile enforce mismatch for {profile}: got torch={installed_torch}, cuda={installed_cuda}, torchvision={installed_tv}, torchaudio={installed_ta}"
+        ));
+    }
+    Ok(())
 }
 
 fn install_custom_node(
@@ -1626,19 +1713,28 @@ fn append_attention_launch_arg(args: &mut Vec<String>, backend: Option<&str>) {
         .as_deref()
     {
         Some("flash") => args.push("--use-flash-attention".to_string()),
-        Some("sage") => args.push("--use-sage-attention".to_string()),
+        Some("sage") | Some("sage3") => args.push("--use-sage-attention".to_string()),
         _ => {}
     }
 }
 
 fn detect_attention_backend_for_root(root: &Path) -> Option<String> {
-    let has_flash = pip_has_package(root, "flash-attn") || pip_has_package(root, "flash_attn");
+    let has_flash = pip_has_package(root, "flash-attn")
+        || pip_has_package(root, "flash_attn")
+        || python_module_importable(root, "flash_attn");
     if has_flash {
         return Some("flash".to_string());
     }
-    let has_sage = pip_has_package(root, "sageattention") || pip_has_package(root, "sageattn3");
+    let has_sage3 = pip_has_package(root, "sageattn3") || python_module_importable(root, "sageattn3");
+    if has_sage3 {
+        return Some("sage3".to_string());
+    }
+    let has_sage = pip_has_package(root, "sageattention") || python_module_importable(root, "sageattention");
     if has_sage {
         return Some("sage".to_string());
+    }
+    if nunchaku_backend_present(root) {
+        return Some("nunchaku".to_string());
     }
     None
 }
@@ -1659,6 +1755,7 @@ fn run_comfyui_install(
     cancel: &CancellationToken,
 ) -> Result<PathBuf, String> {
     let mut summary: Vec<InstallSummaryItem> = Vec::new();
+    let include_insight_face = request.include_insight_face || request.include_nunchaku;
     let selected_attention = [
         request.include_sage_attention,
         request.include_sage_attention3,
@@ -1947,6 +2044,39 @@ fn run_comfyui_install(
             nunchaku_whl,
             true,
         )?;
+        if include_insight_face {
+            write_install_state(&install_root, "in_progress", "addon_insightface");
+            if request.include_nunchaku && !request.include_insight_face {
+                emit_install_event(
+                    app,
+                    "step",
+                    "Installing InsightFace (required by Nunchaku)...",
+                );
+            } else {
+                emit_install_event(app, "step", "Installing InsightFace...");
+            }
+            install_insightface(
+                &comfy_dir,
+                &uv_bin,
+                &py_exe.to_string_lossy(),
+                &python_store_s,
+            )?;
+        }
+        install_nunchaku_node_requirements(
+            &comfy_dir,
+            &uv_bin,
+            &py_exe.to_string_lossy(),
+            &python_store_s,
+            &nunchaku_node,
+        )?;
+        emit_install_event(app, "step", "Reasserting CUDA Torch stack after Nunchaku dependencies...");
+        reassert_torch_stack_for_profile(
+            &uv_bin,
+            &py_exe.to_string_lossy(),
+            &comfy_dir,
+            &python_store_s,
+            &selected_profile,
+        )?;
 
         finalize_nunchaku_install(
             app,
@@ -2001,7 +2131,7 @@ fn run_comfyui_install(
         };
         install_wheel_no_deps(&uv_bin, &py_exe.to_string_lossy(), &comfy_dir, &python_store_s, whl, false)?;
     }
-    if request.include_insight_face {
+    if include_insight_face && !request.include_nunchaku {
         write_install_state(&install_root, "in_progress", "addon_insightface");
         emit_install_event(app, "step", "Installing InsightFace...");
         install_insightface(
@@ -2161,6 +2291,16 @@ fn run_comfyui_install(
                 emit_install_event(app, "warn", &format!("comfyui-crystools failed: {err}"));
             }
         }
+    }
+
+    if include_insight_face || request.include_nunchaku {
+        emit_install_event(app, "step", "Finalizing InsightFace runtime compatibility...");
+        ensure_insightface_runtime_compat(
+            &comfy_dir,
+            &uv_bin,
+            &py_exe.to_string_lossy(),
+            &python_store_s,
+        )?;
     }
 
     write_install_summary(&install_root, &summary);
@@ -3207,21 +3347,64 @@ fn start_comfyui_root_impl(
     }
 
     let settings = state.context.config.settings();
+    let configured_root_matches = settings
+        .comfyui_root
+        .as_ref()
+        .map(|configured_root| {
+            strip_windows_verbatim_prefix(
+                &std::fs::canonicalize(configured_root)
+                    .unwrap_or_else(|_| PathBuf::from(configured_root)),
+            ) == root
+        })
+        .unwrap_or(false);
     let effective_attention = {
-        let configured = settings.comfyui_attention_backend.clone();
+        let configured = if configured_root_matches {
+            settings.comfyui_attention_backend.clone()
+        } else {
+            None
+        };
         match configured.as_deref() {
+            Some("none") => None,
+            Some("sage3") => {
+                if python_module_importable(&root, "sageattn3") {
+                    Some("sage3".to_string())
+                } else {
+                    return Err(
+                        "SageAttention3 is selected but not importable in this install. Re-apply SageAttention3 for this ComfyUI root."
+                            .to_string(),
+                    );
+                }
+            }
             Some("sage") => {
-                if pip_has_package(&root, "sageattention") || pip_has_package(&root, "sageattn3") {
+                if python_module_importable(&root, "sageattention")
+                    || python_module_importable(&root, "sageattn3")
+                {
                     Some("sage".to_string())
                 } else {
-                    detect_attention_backend_for_root(&root)
+                    return Err(
+                        "SageAttention is selected but not importable in this install. Re-apply SageAttention for this ComfyUI root."
+                            .to_string(),
+                    );
                 }
             }
             Some("flash") => {
-                if pip_has_package(&root, "flash-attn") || pip_has_package(&root, "flash_attn") {
+                if python_module_importable(&root, "flash_attn") {
                     Some("flash".to_string())
                 } else {
-                    detect_attention_backend_for_root(&root)
+                    return Err(
+                        "FlashAttention is selected but not importable in this install. Re-apply FlashAttention for this ComfyUI root."
+                            .to_string(),
+                    );
+                }
+            }
+            Some("nunchaku") => {
+                if nunchaku_backend_present(&root) {
+                    Some("nunchaku".to_string())
+                } else {
+                    return Err(
+                        "Nunchaku is selected but backend is not installed correctly for this ComfyUI root. Re-apply Nunchaku."
+                            .to_string(),
+                    );
                 }
             }
             _ => detect_attention_backend_for_root(&root),
@@ -3576,6 +3759,49 @@ fn pip_has_package(root: &Path, package: &str) -> bool {
     cmd.output().map(|out| out.status.success()).unwrap_or(false)
 }
 
+fn python_module_importable(root: &Path, module: &str) -> bool {
+    let mut cmd = python_for_root(root);
+    cmd.arg("-c")
+        .arg(format!("import importlib.util, sys; sys.exit(0 if importlib.util.find_spec({module:?}) else 1)"));
+    cmd.current_dir(root);
+    cmd.output().map(|out| out.status.success()).unwrap_or(false)
+}
+
+fn python_module_import_error(root: &Path, module: &str) -> Option<String> {
+    let mut cmd = python_for_root(root);
+    cmd.arg("-c")
+        .arg(format!("import importlib; importlib.import_module({module:?})"));
+    cmd.current_dir(root);
+    let output = cmd.output().ok()?;
+    if output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut message = String::new();
+    if !stdout.is_empty() {
+        message.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !message.is_empty() {
+            message.push_str(" | ");
+        }
+        message.push_str(&stderr);
+    }
+    if message.is_empty() {
+        Some(format!("Failed to import module: {module}"))
+    } else {
+        Some(message)
+    }
+}
+
+fn nunchaku_backend_present(root: &Path) -> bool {
+    python_module_importable(root, "nunchaku")
+        || pip_has_package(root, "nunchaku")
+        || custom_node_exists(root, "nunchaku_nodes")
+        || custom_node_exists(root, "ComfyUI-nunchaku")
+}
+
 fn custom_node_exists(root: &Path, name: &str) -> bool {
     root.join("custom_nodes").join(name).is_dir()
 }
@@ -3881,6 +4107,14 @@ fn apply_attention_backend_change(
                 ],
                 Some(&root),
             )?;
+            install_insightface(&root, &uv_bin, &py_path, &uv_python_install_dir)?;
+            install_nunchaku_node_requirements(
+                &root,
+                &uv_bin,
+                &py_path,
+                &uv_python_install_dir,
+                &nunchaku_node,
+            )?;
         }
         install_wheel_no_deps(
             &uv_bin,
@@ -3904,6 +4138,13 @@ fn apply_attention_backend_change(
             }
         }
         if target == "nunchaku" {
+            reassert_torch_stack_for_profile(
+                &uv_bin,
+                &py_path,
+                &root,
+                &uv_python_install_dir,
+                &profile,
+            )?;
             finalize_nunchaku_install(
                 &app,
                 &root,
@@ -3947,6 +4188,7 @@ fn apply_attention_backend_change(
     let target_setting = match target.as_str() {
         "sage" | "sage3" => Some("sage".to_string()),
         "flash" => Some("flash".to_string()),
+        "nunchaku" => Some("nunchaku".to_string()),
         _ => None,
     };
     let _ = state
@@ -3974,13 +4216,32 @@ fn install_insightface(
     py_path: &str,
     uv_python_install_dir: &str,
 ) -> Result<(), String> {
+    uv_pip_uninstall_best_effort(
+        uv_bin,
+        Path::new(py_path),
+        root,
+        uv_python_install_dir,
+        &["insightface", "filterpywhl", "facexlib"],
+    )?;
+    install_insightface_variant(root, uv_bin, py_path, uv_python_install_dir)?;
+    ensure_insightface_runtime_compat(root, uv_bin, py_path, uv_python_install_dir)
+}
+
+fn install_insightface_variant(
+    root: &Path,
+    uv_bin: &str,
+    py_path: &str,
+    uv_python_install_dir: &str,
+) -> Result<(), String> {
     run_uv_pip_strict(
         uv_bin,
         py_path,
         &[
             "install",
-            "https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp312-cp312-win_amd64.whl",
-            "--no-deps",
+            "--force-reinstall",
+            "numpy==1.26.4",
+            "opencv-python==4.11.0.86",
+            "opencv-python-headless==4.11.0.86",
             "--no-cache-dir",
             "--timeout=1000",
             "--retries",
@@ -3994,9 +4255,33 @@ fn install_insightface(
         py_path,
         &[
             "install",
-            "filterpywhl",
+            "--force-reinstall",
+            "insightface==0.7.3",
+            "--no-cache-dir",
+            "--timeout=1000",
+            "--retries",
+            "10",
+        ],
+        Some(root),
+        &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+    )?;
+    // InsightFace imports pull in several runtime deps in a plain venv.
+    // Install these explicitly, then re-pin numpy below for ABI stability.
+    run_uv_pip_strict(
+        uv_bin,
+        py_path,
+        &[
+            "install",
+            "--upgrade",
+            "scikit-image",
+            "scikit-learn",
+            "easydict",
+            "prettytable",
+            "albumentations",
+            "cython",
+            "matplotlib",
             "facexlib",
-            "--no-deps",
+            "filterpywhl",
             "--no-cache-dir",
             "--timeout=1000",
             "--retries",
@@ -4012,7 +4297,6 @@ fn install_insightface(
             "install",
             "--force-reinstall",
             "numpy==1.26.4",
-            "--no-deps",
             "--no-cache-dir",
             "--timeout=1000",
             "--retries",
@@ -4021,6 +4305,142 @@ fn install_insightface(
         Some(root),
         &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
     )?;
+    if !python_module_importable(root, "cv2") {
+        run_uv_pip_strict(
+            uv_bin,
+            py_path,
+            &[
+                "install",
+                "--upgrade",
+                "opencv-python==4.11.0.86",
+                "opencv-python-headless==4.11.0.86",
+                "--no-cache-dir",
+                "--timeout=1000",
+                "--retries",
+                "10",
+            ],
+            Some(root),
+            &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_insightface_runtime_compat(
+    root: &Path,
+    uv_bin: &str,
+    py_path: &str,
+    uv_python_install_dir: &str,
+) -> Result<(), String> {
+    for _ in 0..5 {
+        let Some(err) = python_module_import_error(root, "insightface.app") else {
+            cleanup_tilde_site_packages(root);
+            return Ok(());
+        };
+
+        let expected_96_got_88 =
+            err.contains("numpy.dtype size changed") && err.contains("Expected 96") && err.contains("got 88");
+        let expected_88_got_96 =
+            err.contains("numpy.dtype size changed") && err.contains("Expected 88") && err.contains("got 96");
+        let missing_cv2 = err.contains("No module named 'cv2'");
+        let missing_skimage = err.contains("No module named 'skimage'");
+
+        if expected_96_got_88 {
+            run_uv_pip_strict(
+                uv_bin,
+                py_path,
+                &[
+                    "install",
+                    "--force-reinstall",
+                    "numpy==1.26.4",
+                    "opencv-python==4.11.0.86",
+                    "opencv-python-headless==4.11.0.86",
+                    "--no-cache-dir",
+                    "--timeout=1000",
+                    "--retries",
+                    "10",
+                ],
+                Some(root),
+                &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+            )?;
+            run_uv_pip_strict(
+                uv_bin,
+                py_path,
+                &[
+                    "install",
+                    "--force-reinstall",
+                    "insightface==0.7.3",
+                    "--no-cache-dir",
+                    "--timeout=1000",
+                    "--retries",
+                    "10",
+                ],
+                Some(root),
+                &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+            )?;
+            cleanup_tilde_site_packages(root);
+        } else if expected_88_got_96 {
+            run_uv_pip_strict(
+                uv_bin,
+                py_path,
+                &[
+                    "install",
+                    "--force-reinstall",
+                    "numpy==1.26.4",
+                    "opencv-python==4.11.0.86",
+                    "opencv-python-headless==4.11.0.86",
+                    "--no-cache-dir",
+                    "--timeout=1000",
+                    "--retries",
+                    "10",
+                ],
+                Some(root),
+                &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+            )?;
+            cleanup_tilde_site_packages(root);
+        } else if missing_cv2 {
+            run_uv_pip_strict(
+                uv_bin,
+                py_path,
+                &[
+                    "install",
+                    "--upgrade",
+                    "opencv-python==4.11.0.86",
+                    "opencv-python-headless==4.11.0.86",
+                    "--no-cache-dir",
+                    "--timeout=1000",
+                    "--retries",
+                    "10",
+                ],
+                Some(root),
+                &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+            )?;
+            cleanup_tilde_site_packages(root);
+        } else if missing_skimage {
+            run_uv_pip_strict(
+                uv_bin,
+                py_path,
+                &[
+                    "install",
+                    "--upgrade",
+                    "scikit-image",
+                    "--no-cache-dir",
+                    "--timeout=1000",
+                    "--retries",
+                    "10",
+                ],
+                Some(root),
+                &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+            )?;
+            cleanup_tilde_site_packages(root);
+        } else {
+            return Err(format!("InsightFace install incomplete: {err}"));
+        }
+    }
+    if let Some(err2) = python_module_import_error(root, "insightface.app") {
+        return Err(format!("InsightFace install incomplete: {err2}"));
+    }
+    cleanup_tilde_site_packages(root);
     Ok(())
 }
 
@@ -4049,35 +4469,44 @@ fn cleanup_tilde_site_packages(root: &Path) {
 fn finalize_nunchaku_install(
     app: &AppHandle,
     root: &Path,
-    uv_bin: &str,
-    py_path: &str,
-    uv_python_install_dir: &str,
+    _uv_bin: &str,
+    _py_path: &str,
+    _uv_python_install_dir: &str,
     nunchaku_node: &Path,
 ) -> Result<(), String> {
-    // Match the legacy BAT behavior: fetch versions JSON + force numpy 1.26.4.
+    // Match linux flow: fetch versions JSON and cleanup stale temp site-packages artifacts.
     let nunchaku_versions_path = nunchaku_node.join("nunchaku_versions.json");
     let _ = download_nunchaku_versions_json(app, &nunchaku_versions_path);
 
     cleanup_tilde_site_packages(root);
 
+    Ok(())
+}
+
+fn install_nunchaku_node_requirements(
+    root: &Path,
+    uv_bin: &str,
+    py_path: &str,
+    uv_python_install_dir: &str,
+    nunchaku_node: &Path,
+) -> Result<(), String> {
+    let req = nunchaku_node.join("requirements.txt");
+    if req.exists() {
+        run_uv_pip_strict(
+            uv_bin,
+            py_path,
+            &["install", "-r", &req.to_string_lossy()],
+            Some(root),
+            &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+        )?;
+    }
     run_uv_pip_strict(
         uv_bin,
         py_path,
-        &[
-            "install",
-            "--force-reinstall",
-            "numpy==1.26.4",
-            "--no-deps",
-            "--no-cache-dir",
-            "--timeout=1000",
-            "--retries",
-            "10",
-            "--use-pep517",
-        ],
+        &["install", "--upgrade", "accelerate", "diffusers"],
         Some(root),
         &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
     )?;
-
     Ok(())
 }
 
@@ -4216,22 +4645,6 @@ fn install_trellis2(
         "https://raw.githubusercontent.com/visualbruno/CuMesh/main/cumesh/remeshing.py",
         &site_packages.join("cumesh").join("remeshing.py"),
     )?;
-    run_uv_pip_strict(
-        uv_bin,
-        py_path,
-        &[
-            "install",
-            "--force-reinstall",
-            "numpy==1.26.4",
-            "--no-deps",
-            "--no-cache-dir",
-            "--timeout=1000",
-            "--retries",
-            "10",
-        ],
-        Some(root),
-        &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
-    )?;
     Ok(())
 }
 
@@ -4329,6 +4742,15 @@ async fn apply_comfyui_component_toggle(
                         )?;
                         Ok("Installed InsightFace.".to_string())
                     } else {
+                        let nunchaku_active = pip_has_package(&root_clone, "nunchaku")
+                            || custom_node_exists(&root_clone, "ComfyUI-nunchaku")
+                            || custom_node_exists(&root_clone, "nunchaku_nodes");
+                        if nunchaku_active {
+                            return Err(
+                                "Cannot remove InsightFace while Nunchaku is selected. Switch attention backend first."
+                                    .to_string(),
+                            );
+                        }
                         uninstall_insightface(
                             &root_clone,
                             &uv_bin_clone,

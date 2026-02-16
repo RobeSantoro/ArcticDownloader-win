@@ -9,8 +9,10 @@ use std::{
 };
 
 const SETTINGS_FILE: &str = "settings.json";
-const FALLBACK_REMOTE_CATALOG_URL: &str =
+const LEGACY_REMOTE_CATALOG_URL: &str =
     "https://raw.githubusercontent.com/ArcticLatent/ArcticDownloader-flatpak/refs/heads/main/data/catalog.json";
+const FALLBACK_REMOTE_CATALOG_URL: &str =
+    "https://raw.githubusercontent.com/ArcticLatent/Arctic-Helper/refs/heads/main/assets/catalog.json";
 
 #[derive(Debug)]
 pub struct ConfigStore {
@@ -53,6 +55,9 @@ impl ConfigStore {
         if settings.catalog_endpoint.is_none() {
             settings.catalog_endpoint = default_catalog_endpoint();
             persist_defaults = settings_path.exists();
+        } else if settings.catalog_endpoint.as_deref() == Some(LEGACY_REMOTE_CATALOG_URL) {
+            settings.catalog_endpoint = default_catalog_endpoint();
+            persist_defaults = true;
         }
 
         let store = Self {

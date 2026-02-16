@@ -660,6 +660,12 @@ function updateComfyModeUi() {
   const installMode = state.comfyMode !== "manage";
   const hasSelectedInstall = Boolean(String(el.comfyExistingInstall?.value || "").trim());
   const canShowManageActions = !installMode && hasSelectedInstall;
+  if (el.comfyTorchProfile) {
+    el.comfyTorchProfile.disabled = !installMode;
+    el.comfyTorchProfile.title = installMode
+      ? ""
+      : "Torch stack is locked while managing an existing install.";
+  }
   el.installComfyui?.classList.toggle("hidden", !installMode);
   el.comfyResumeBanner?.classList.toggle("hidden", !installMode || !state.comfyResumeState?.found);
   el.comfyOpenInstallFolder?.classList.toggle("hidden", !canShowManageActions);
@@ -814,13 +820,20 @@ async function syncComfyInstallSelection(selectedPath, persistInstallBase = true
       state.comfyMode = "manage";
       if (el.comfyMode) el.comfyMode.value = "manage";
       updateComfyModeUi();
+      let managedRoot = "";
       if (pickedRootDirectly || installs.length === 1) {
         await applySelectedExistingInstallation(detectedRoot);
+        managedRoot = normalizeSlashes(detectedRoot);
       } else if (installs.length > 1 && state.comfyMode === "manage") {
         await applySelectedExistingInstallation(el.comfyExistingInstall.value);
+        managedRoot = normalizeSlashes(el.comfyExistingInstall.value || "");
       }
       setComfyQuickActions(baseForInstall, detectedRoot);
-      logComfyLine(`Detected existing ComfyUI install: ${detectedRoot}`);
+      if (installs.length > 1 && !pickedRootDirectly) {
+        logComfyLine(`Detected ${installs.length} ComfyUI installs. Managing: ${managedRoot || detectedRoot}`);
+      } else {
+        logComfyLine(`Detected existing ComfyUI install: ${managedRoot || detectedRoot}`);
+      }
       await refreshComfyRuntimeStatus();
       if (state.comfyRuntimeRunning) {
         logComfyLine("Detected running ComfyUI server. If you want to start a different one, stop this server first.");
@@ -1006,6 +1019,16 @@ function applyComfyAddonRules() {
     el.addonTrellis2.disabled = !trellisAllowed;
     if (!trellisAllowed && wasChecked) {
       el.addonTrellis2.checked = false;
+    }
+  }
+
+  if (el.addonNunchaku && el.addonInsightFace) {
+    const nunchakuSelected = Boolean(el.addonNunchaku.checked);
+    if (nunchakuSelected) {
+      el.addonInsightFace.checked = true;
+      el.addonInsightFace.disabled = true;
+    } else {
+      el.addonInsightFace.disabled = false;
     }
   }
 }
@@ -1783,6 +1806,7 @@ el.addonFlashAttention?.addEventListener("change", () => {
   applyAttentionBackendFromToggle(el.addonFlashAttention).catch((err) => logComfyLine(String(err)));
 });
 el.addonNunchaku?.addEventListener("change", () => {
+  applyComfyAddonRules();
   applyAttentionBackendFromToggle(el.addonNunchaku).catch((err) => logComfyLine(String(err)));
 });
 el.addonInsightFace?.addEventListener("change", () => {
@@ -1840,7 +1864,9 @@ el.comfyClearInstallLog?.addEventListener("click", () => {
 });
 
 el.comfyOpenInstallFolder?.addEventListener("click", async () => {
-  const path = String(el.comfyOpenInstallFolder.dataset.path || "").trim();
+  const path = String(
+    el.comfyExistingInstall?.value || el.comfyRoot?.value || el.comfyOpenInstallFolder.dataset.path || "",
+  ).trim();
   if (!path) return;
   try {
     await invoke("open_folder", { path });
@@ -1850,8 +1876,16 @@ el.comfyOpenInstallFolder?.addEventListener("click", async () => {
 });
 
 el.comfyStartInstalled?.addEventListener("click", async () => {
-  const path = String(el.comfyStartInstalled.dataset.path || "").trim();
+  const path = String(
+    el.comfyExistingInstall?.value || el.comfyRoot?.value || el.comfyStartInstalled.dataset.path || "",
+  ).trim();
   if (!path) return;
+  if (el.comfyStartInstalled) {
+    el.comfyStartInstalled.dataset.path = path;
+  }
+  if (el.comfyOpenInstallFolder) {
+    el.comfyOpenInstallFolder.dataset.path = path;
+  }
   try {
     if (state.comfyRuntimeRunning) {
       state.comfyRuntimeStarting = false;
