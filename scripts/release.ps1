@@ -9,6 +9,11 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Write-Utf8NoBom([string]$Path, [string]$Content) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+
 function Require-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         throw "Required command '$Name' was not found in PATH."
@@ -28,11 +33,12 @@ function Resolve-CargoExe {
 
 function Update-CargoVersion([string]$Path, [string]$NewVersion) {
     $raw = Get-Content $Path -Raw
-    $updated = [regex]::Replace($raw, '(?m)^version\s*=\s*".*?"\s*$', "version = `"$NewVersion`"", 1)
-    if ($updated -eq $raw) {
+    $pattern = '(?m)^version\s*=\s*".*?"\s*$'
+    if (-not [regex]::IsMatch($raw, $pattern)) {
         throw "Could not update version in $Path"
     }
-    Set-Content -Path $Path -Value $updated -Encoding utf8
+    $updated = [regex]::Replace($raw, $pattern, "version = `"$NewVersion`"", 1)
+    Write-Utf8NoBom -Path $Path -Content $updated
 }
 
 function Prompt-ReleaseNotes {
@@ -81,7 +87,8 @@ Write-Host "Updating versions to $Version ..."
 Update-CargoVersion -Path $tauriCargo -NewVersion $Version
 $conf = Get-Content $tauriConf -Raw | ConvertFrom-Json
 $conf.version = $Version
-$conf | ConvertTo-Json -Depth 20 | Set-Content -Path $tauriConf -Encoding utf8
+$confJson = $conf | ConvertTo-Json -Depth 20
+Write-Utf8NoBom -Path $tauriConf -Content $confJson
 
 if (-not $SkipClean) {
     Write-Host "Running clean build..."
@@ -120,10 +127,11 @@ $updateManifest = [ordered]@{
     notes        = $notes
 }
 $updatePath = Join-Path $dist "update.json"
-$updateManifest | ConvertTo-Json -Depth 10 | Set-Content -Path $updatePath -Encoding utf8
+$updateJson = $updateManifest | ConvertTo-Json -Depth 10
+Write-Utf8NoBom -Path $updatePath -Content $updateJson
 
 $notesPath = Join-Path $dist "release-notes-$tag.md"
-$notes | Set-Content -Path $notesPath -Encoding utf8
+Write-Utf8NoBom -Path $notesPath -Content $notes
 
 Write-Host "Publishing GitHub release $tag to $Repository ..."
 & gh release view $tag --repo $Repository | Out-Null

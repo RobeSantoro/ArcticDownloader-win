@@ -8,6 +8,8 @@
 build-dir/
 repo/
 *.flatpak
+/dist/
+/update.json
 
 
 # Added by cargo
