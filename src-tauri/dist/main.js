@@ -1,6 +1,7 @@
 const invoke = window.__TAURI__?.core?.invoke;
 const listen = window.__TAURI__?.event?.listen || window.__TAURI__?.core?.listen;
 const DOT_SEP = " \u2022 ";
+const PATH_SEP = "/";
 const state = {
   catalog: null,
   settings: null,
@@ -34,7 +35,14 @@ const state = {
   comfyUpdateBusy: false,
   comfyLatestVersion: null,
   comfyLastUpdateDetailLogKey: "",
+  comfyTorchProfileLocked: false,
+  comfyAddonLoadSeq: 0,
+  comfyTorchRecommendedBase: "Recommended 'Torch 2.8.0 + cu128' for your GPU",
+  sharedModelsRootDefault: "",
+  sharedModelsUseDefault: false,
 };
+
+let progressSmoothTimer = null;
 
 const ramOptions = [
   { id: "tier_a", label: "Tier A (64 GB+)" },
@@ -59,6 +67,7 @@ const el = {
   version: document.getElementById("version"),
   updateStatus: document.getElementById("update-status"),
   statusLog: document.getElementById("status-log"),
+  clearStatusLog: document.getElementById("clear-status-log"),
   progressLine: document.getElementById("download-progress"),
   overallProgress: document.getElementById("overall-progress"),
   overallProgressFill: document.getElementById("overall-progress-fill"),
@@ -71,9 +80,11 @@ const el = {
   tabComfyui: document.getElementById("tab-comfyui"),
   tabModels: document.getElementById("tab-models"),
   tabLoras: document.getElementById("tab-loras"),
+  tabWorkflows: document.getElementById("tab-workflows"),
   contentComfyui: document.getElementById("tab-content-comfyui"),
   contentModels: document.getElementById("tab-content-models"),
   contentLoras: document.getElementById("tab-content-loras"),
+  contentWorkflows: document.getElementById("tab-content-workflows"),
   downloadsStatusPanel: document.getElementById("downloads-status-panel"),
 
   comfyTorchProfile: document.getElementById("comfy-torch-profile"),
@@ -86,6 +97,11 @@ const el = {
   comfyInstallRoot: document.getElementById("comfy-install-root"),
   chooseInstallRoot: document.getElementById("choose-install-root"),
   saveInstallRoot: document.getElementById("save-install-root"),
+  comfyExtraModelRow: document.getElementById("comfy-extra-model-row"),
+  comfyExtraModelRoot: document.getElementById("comfy-extra-model-root"),
+  chooseExtraModelRoot: document.getElementById("choose-extra-model-root"),
+  comfyExtraModelDefault: document.getElementById("comfy-extra-model-default"),
+  clearExtraModelRoot: document.getElementById("clear-extra-model-root"),
   comfyResumeBanner: document.getElementById("comfy-resume-banner"),
   comfyResumeText: document.getElementById("comfy-resume-text"),
   comfyResumeBtn: document.getElementById("comfy-resume-btn"),
@@ -121,6 +137,9 @@ const el = {
   comfyRootLora: document.getElementById("comfy-root-lora"),
   chooseRootLora: document.getElementById("choose-root-lora"),
   saveRootLora: document.getElementById("save-root-lora"),
+  comfyRootWorkflow: document.getElementById("comfy-root-workflow"),
+  chooseRootWorkflow: document.getElementById("choose-root-workflow"),
+  saveRootWorkflow: document.getElementById("save-root-workflow"),
 
   modelFamily: document.getElementById("model-family"),
   modelId: document.getElementById("model-id"),
@@ -128,12 +147,16 @@ const el = {
   ramTier: document.getElementById("ram-tier"),
   variantId: document.getElementById("variant-id"),
   downloadModel: document.getElementById("download-model"),
+  enableHfXet: document.getElementById("enable-hf-xet"),
 
   loraFamily: document.getElementById("lora-family"),
   loraId: document.getElementById("lora-id"),
   civitaiToken: document.getElementById("civitai-token"),
   saveToken: document.getElementById("save-token"),
   downloadLora: document.getElementById("download-lora"),
+  workflowFamily: document.getElementById("workflow-family"),
+  workflowId: document.getElementById("workflow-id"),
+  downloadWorkflow: document.getElementById("download-workflow"),
 
   metaCreator: document.getElementById("meta-creator"),
   metaCreatorLink: document.getElementById("meta-creator-link"),
@@ -144,10 +167,15 @@ const el = {
   previewImage: document.getElementById("preview-image"),
   previewVideo: document.getElementById("preview-video"),
   previewCaption: document.getElementById("preview-caption"),
+  workflowPreviewImage: document.getElementById("workflow-preview-image"),
+  workflowPreviewCaption: document.getElementById("workflow-preview-caption"),
+  workflowYoutubeLink: document.getElementById("workflow-youtube-link"),
   confirmOverlay: document.getElementById("confirm-overlay"),
   confirmMessage: document.getElementById("confirm-message"),
   confirmYes: document.getElementById("confirm-yes"),
   confirmNo: document.getElementById("confirm-no"),
+  startupOverlay: document.getElementById("startup-overlay"),
+  startupStatus: document.getElementById("startup-status"),
 };
 
 function logLine(text) {
@@ -165,6 +193,22 @@ function logComfyLine(text) {
     .toUpperCase();
   if (!el.comfyInstallLog) return;
   el.comfyInstallLog.textContent = `[${stamp}] ${text}\n` + el.comfyInstallLog.textContent;
+}
+
+function setStartupStatus(text) {
+  if (!el.startupStatus) return;
+  el.startupStatus.textContent = String(text || "Preparing workspace...");
+}
+
+function hideStartupOverlay() {
+  const overlay = el.startupOverlay;
+  if (!overlay || overlay.classList.contains("hidden")) return;
+  overlay.classList.add("is-hiding");
+  window.setTimeout(() => {
+    overlay.classList.add("hidden");
+    overlay.classList.remove("is-hiding");
+    overlay.setAttribute("aria-busy", "false");
+  }, 240);
 }
 
 function notifySystem(title, body) {
@@ -233,13 +277,23 @@ function showConfirmDialog(message) {
     };
 
     messageEl.textContent = String(message || "Are you sure?");
-    overlay.classList.remove("hidden");
-    overlay.setAttribute("aria-hidden", "false");
     yesBtn.addEventListener("click", onYes);
     noBtn.addEventListener("click", onNo);
     overlay.addEventListener("click", onOverlay);
     window.addEventListener("keydown", onKeyDown);
-    yesBtn.focus();
+    window.requestAnimationFrame(() => {
+      overlay.classList.remove("hidden");
+      overlay.setAttribute("aria-hidden", "false");
+      window.requestAnimationFrame(() => yesBtn.focus());
+    });
+  });
+}
+
+function waitForNextPaint() {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(resolve);
+    });
   });
 }
 
@@ -263,11 +317,15 @@ function renderTitleMeta() {
   const label = comfy.toLowerCase().startsWith("v") ? comfy : `v${comfy}`;
   el.version.textContent = `${base}${DOT_SEP}ComfyUI ${label}`;
   const latest = String(state.comfyLatestVersion || "").trim();
-  if (state.comfyUpdateAvailable && latest) {
-    const latestLabel = latest.toLowerCase().startsWith("v") ? latest : `v${latest}`;
+  if (state.comfyUpdateAvailable) {
     const badge = document.createElement("span");
     badge.className = "latest-version-badge";
-    badge.textContent = `${DOT_SEP}(latest ${latestLabel})`;
+    if (latest) {
+      const latestLabel = latest.toLowerCase().startsWith("v") ? latest : `v${latest}`;
+      badge.textContent = `${DOT_SEP}(latest ${latestLabel})`;
+    } else {
+      badge.textContent = `${DOT_SEP}(update available)`;
+    }
     el.version.appendChild(badge);
   }
 }
@@ -339,15 +397,27 @@ function updateUpdateButton() {
 function normalizeSlashes(value) {
   const raw = String(value || "").trim();
   if (!raw) return "";
-  const withoutPrefix = raw.startsWith("\\\\?\\")
-    ? raw.slice(4)
-    : (raw.startsWith("\\?\\") ? raw.slice(3) : raw);
-  return withoutPrefix.replace(/\//g, "\\").replace(/[\\]+/g, "\\");
+  const normalized = raw.replace(/[\\/]+/g, PATH_SEP);
+  const nestedHome = `${PATH_SEP}src-tauri${PATH_SEP}home${PATH_SEP}`;
+  const idx = normalized.indexOf(nestedHome);
+  if (idx >= 0) {
+    return normalized.slice(idx + `${PATH_SEP}src-tauri`.length);
+  }
+  return normalized;
+}
+
+function setTorchRecommendedDetecting(detecting) {
+  if (!el.comfyTorchRecommended) return;
+  if (detecting) {
+    el.comfyTorchRecommended.textContent = "Detecting torch/add-ons for selected install...";
+  } else {
+    el.comfyTorchRecommended.textContent = state.comfyTorchRecommendedBase;
+  }
 }
 
 function parentDir(path) {
   const normalized = normalizeSlashes(path);
-  const idx = normalized.lastIndexOf("\\");
+  const idx = normalized.lastIndexOf(PATH_SEP);
   if (idx <= 0) return normalized;
   return normalized.slice(0, idx);
 }
@@ -378,7 +448,7 @@ function newestComfyInstall(installs) {
 function comfyInstallNameFromRoot(rootPath) {
   const normalized = normalizeSlashes(String(rootPath || "").trim());
   if (!normalized) return "ComfyUI";
-  const parts = normalized.split("\\").filter(Boolean);
+  const parts = normalized.split(PATH_SEP).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : "ComfyUI";
 }
 
@@ -404,8 +474,11 @@ function setComfyQuickActions(installDir, comfyRoot) {
 }
 
 function buildComfyInstallRequest() {
+  const extraModelRoot = String(el.comfyExtraModelRoot?.value || "").trim();
   return {
     installRoot: String(el.comfyInstallRoot.value || "").trim(),
+    extraModelRoot: extraModelRoot || null,
+    extraModelUseDefault: Boolean(el.comfyExtraModelDefault?.checked && extraModelRoot),
     torchProfile: el.comfyTorchProfile.value || null,
     includeSageAttention: Boolean(el.addonSageAttention.checked),
     includeSageAttention3: Boolean(el.addonSageAttention3.checked),
@@ -444,8 +517,19 @@ function resetComfySelectionsToDefaults() {
 async function loadInstalledAddonState(comfyuiRoot) {
   const root = String(comfyuiRoot || el.comfyRoot.value || "").trim();
   if (!root) return;
+  const loadSeq = ++state.comfyAddonLoadSeq;
   try {
     const installed = await invoke("get_comfyui_addon_state", { comfyuiRoot: root });
+    if (loadSeq !== state.comfyAddonLoadSeq) return;
+    const selectedRoot = normalizeSlashes(String(
+      el.comfyExistingInstall?.value || el.comfyRoot.value || "",
+    ).trim());
+    if (selectedRoot && normalizeSlashes(root) !== selectedRoot) return;
+    const installedTorchProfile = String(installed?.torch_profile || "").trim();
+    if (installedTorchProfile && comfyTorchProfiles.some((x) => x.value === installedTorchProfile)) {
+      el.comfyTorchProfile.value = installedTorchProfile;
+      state.comfyTorchProfileLocked = true;
+    }
     if (el.addonSageAttention) el.addonSageAttention.checked = Boolean(installed?.sage_attention);
     if (el.addonSageAttention3) el.addonSageAttention3.checked = Boolean(installed?.sage_attention3);
     if (el.addonFlashAttention) el.addonFlashAttention.checked = Boolean(installed?.flash_attention);
@@ -469,12 +553,23 @@ function updateComfyRuntimeButton() {
   if (!el.comfyStartInstalled) return;
   const running = Boolean(state.comfyRuntimeRunning);
   const starting = Boolean(state.comfyRuntimeStarting);
+  const busy = Boolean(
+    state.comfyAttentionBusy
+    || state.comfyComponentBusy,
+  );
   const target = String(state.comfyRuntimeTarget || "").trim();
   if (starting) {
     el.comfyStartInstalled.textContent = target ? `Starting ${target}...` : "Starting ComfyUI...";
     el.comfyStartInstalled.disabled = true;
     el.comfyStartInstalled.classList.remove("stop-state");
     el.comfyStartInstalled.classList.add("starting-state");
+    return;
+  }
+  if (busy) {
+    el.comfyStartInstalled.textContent = running ? "Stop ComfyUI" : "Applying changes...";
+    el.comfyStartInstalled.disabled = true;
+    el.comfyStartInstalled.classList.toggle("stop-state", running);
+    el.comfyStartInstalled.classList.remove("starting-state");
     return;
   }
   el.comfyStartInstalled.textContent = running ? "Stop ComfyUI" : "Start ComfyUI";
@@ -542,7 +637,9 @@ async function applyAttentionBackendFromToggle(changedBox) {
     return;
   }
 
+  await waitForNextPaint();
   state.comfyAttentionBusy = true;
+  updateComfyRuntimeButton();
   setToggleBusy(changedBox, true);
   try {
     const result = await invoke("apply_attention_backend_change", {
@@ -561,6 +658,7 @@ async function applyAttentionBackendFromToggle(changedBox) {
     await loadInstalledAddonState(root);
   } finally {
     state.comfyAttentionBusy = false;
+    updateComfyRuntimeButton();
     setToggleBusy(changedBox, false);
   }
 }
@@ -585,7 +683,9 @@ async function applyComponentToggleFromCheckbox(changedBox, component, label) {
     return;
   }
 
+  await waitForNextPaint();
   state.comfyComponentBusy = true;
+  updateComfyRuntimeButton();
   setToggleBusy(changedBox, true);
   try {
     const result = await invoke("apply_comfyui_component_toggle", {
@@ -610,6 +710,7 @@ async function applyComponentToggleFromCheckbox(changedBox, component, label) {
       } catch (_) {}
     }
     state.comfyComponentBusy = false;
+    updateComfyRuntimeButton();
     setToggleBusy(changedBox, false);
   }
 }
@@ -656,16 +757,26 @@ function scheduleRuntimeStatusPoll(delayMs = null) {
     scheduleRuntimeStatusPoll();
   }, delay);
 }
+
+async function openComfyWhenReady(timeoutMs = 45000) {
+  const startedAt = Date.now();
+  while ((Date.now() - startedAt) < timeoutMs) {
+    try {
+      const status = await invoke("get_comfyui_runtime_status");
+      if (status?.running) {
+        await invoke("open_external_url", { url: "http://127.0.0.1:8188" });
+        return true;
+      }
+    } catch (_) {}
+    await new Promise((resolve) => window.setTimeout(resolve, 450));
+  }
+  return false;
+}
+
 function updateComfyModeUi() {
   const installMode = state.comfyMode !== "manage";
   const hasSelectedInstall = Boolean(String(el.comfyExistingInstall?.value || "").trim());
   const canShowManageActions = !installMode && hasSelectedInstall;
-  if (el.comfyTorchProfile) {
-    el.comfyTorchProfile.disabled = !installMode;
-    el.comfyTorchProfile.title = installMode
-      ? ""
-      : "Torch stack is locked while managing an existing install.";
-  }
   el.installComfyui?.classList.toggle("hidden", !installMode);
   el.comfyResumeBanner?.classList.toggle("hidden", !installMode || !state.comfyResumeState?.found);
   el.comfyOpenInstallFolder?.classList.toggle("hidden", !canShowManageActions);
@@ -680,6 +791,51 @@ function updateComfyModeUi() {
     el.comfyInstallRoot.placeholder = installMode
       ? "Select base folder (e.g. Documents). App will create /ComfyUI inside it."
       : "Base folder containing ComfyUI installations";
+  }
+  if (el.comfyTorchProfile) {
+    el.comfyTorchProfile.disabled = !installMode;
+    el.comfyTorchProfile.title = installMode
+      ? ""
+      : "Torch stack is locked in Manage Existing mode.";
+  }
+}
+
+async function loadComfyExtraModelConfigForRoot(rootPath) {
+  const root = normalizeSlashes(String(rootPath || "").trim());
+  if (!root) return;
+  try {
+    const cfg = await invoke("get_comfyui_extra_model_config", { comfyuiRoot: root });
+    if (cfg?.configured) {
+      if (el.comfyExtraModelRoot) {
+        el.comfyExtraModelRoot.value = String(cfg.base_path || "").trim();
+      }
+      if (el.comfyExtraModelDefault) {
+        el.comfyExtraModelDefault.checked = Boolean(cfg.use_as_default);
+      }
+      state.sharedModelsRootDefault = String(cfg.base_path || "").trim();
+      state.sharedModelsUseDefault = Boolean(cfg.use_as_default);
+    } else {
+      if (el.comfyExtraModelRoot) el.comfyExtraModelRoot.value = "";
+      if (el.comfyExtraModelDefault) el.comfyExtraModelDefault.checked = false;
+    }
+  } catch (err) {
+    logComfyLine(`Failed loading extra model path config: ${err}`);
+  }
+}
+
+async function persistComfyExtraModelConfigForRoot(rootPath) {
+  const root = normalizeSlashes(String(rootPath || "").trim());
+  if (!root) return;
+  const extraModelRoot = String(el.comfyExtraModelRoot?.value || "").trim();
+  const useAsDefault = Boolean(el.comfyExtraModelDefault?.checked && extraModelRoot);
+  try {
+    await invoke("set_comfyui_extra_model_config", {
+      comfyuiRoot: root,
+      extraModelRoot: extraModelRoot || null,
+      useAsDefault,
+    });
+  } catch (err) {
+    logComfyLine(`Failed to save extra model path config: ${err}`);
   }
 }
 
@@ -751,12 +907,18 @@ async function refreshExistingInstallations(basePath, preferredRoot = null) {
 async function applySelectedExistingInstallation(rootPath) {
   const root = normalizeSlashes(rootPath);
   if (!root) return;
+  setTorchRecommendedDetecting(true);
   el.comfyRoot.value = root;
   el.comfyRootLora.value = root;
-  await invoke("set_comfyui_root", { comfyuiRoot: root });
-  await loadInstalledAddonState(root);
-  setComfyQuickActions(el.comfyInstallRoot.value, root);
-  await refreshComfyUiUpdateStatus(root);
+  try {
+    await invoke("set_comfyui_root", { comfyuiRoot: root });
+    await loadInstalledAddonState(root);
+    await loadComfyExtraModelConfigForRoot(root);
+    setComfyQuickActions(el.comfyInstallRoot.value, root);
+    await refreshComfyUiUpdateStatus(root);
+  } finally {
+    setTorchRecommendedDetecting(false);
+  }
 }
 
 async function refreshComfyUiUpdateStatus(rootPath = null) {
@@ -773,11 +935,15 @@ async function refreshComfyUiUpdateStatus(rootPath = null) {
     state.comfyUpdateChecked = Boolean(status?.checked);
     state.comfyUpdateAvailable = Boolean(status?.update_available);
     state.comfyLatestVersion = status?.latest_version || null;
-    state.selectedComfyVersion = status?.installed_version || null;
+    const detailTextRaw = String(status?.detail || "");
+    const headMatchesTag = Boolean(status?.head_matches_latest_tag);
+    state.selectedComfyVersion = headMatchesTag
+      ? (status?.latest_version || status?.installed_version || null)
+      : (status?.installed_version || null);
     updateComfyUpdateButton();
     renderTitleMeta();
     if (status?.detail) {
-      const detailText = String(status.detail);
+      const detailText = detailTextRaw;
       const detailKey = `${normalizeSlashes(root)}::${detailText}`;
       if (state.comfyLastUpdateDetailLogKey !== detailKey) {
         logComfyLine(detailText);
@@ -795,7 +961,12 @@ async function refreshComfyUiUpdateStatus(rootPath = null) {
   }
 }
 
-async function syncComfyInstallSelection(selectedPath, persistInstallBase = true) {
+async function syncComfyInstallSelection(
+  selectedPath,
+  persistInstallBase = true,
+  keepCurrentMode = false,
+  emitDetectionLog = true,
+) {
   const selected = normalizeSlashes(selectedPath);
   if (!selected) return;
   try {
@@ -817,25 +988,22 @@ async function syncComfyInstallSelection(selectedPath, persistInstallBase = true
         baseForInstall,
         pickedRootDirectly ? detectedRoot : null,
       );
-      state.comfyMode = "manage";
-      if (el.comfyMode) el.comfyMode.value = "manage";
+      if (!keepCurrentMode) {
+        state.comfyMode = "manage";
+        if (el.comfyMode) el.comfyMode.value = "manage";
+      }
       updateComfyModeUi();
-      let managedRoot = "";
       if (pickedRootDirectly || installs.length === 1) {
         await applySelectedExistingInstallation(detectedRoot);
-        managedRoot = normalizeSlashes(detectedRoot);
       } else if (installs.length > 1 && state.comfyMode === "manage") {
         await applySelectedExistingInstallation(el.comfyExistingInstall.value);
-        managedRoot = normalizeSlashes(el.comfyExistingInstall.value || "");
       }
       setComfyQuickActions(baseForInstall, detectedRoot);
-      if (installs.length > 1 && !pickedRootDirectly) {
-        logComfyLine(`Detected ${installs.length} ComfyUI installs. Managing: ${managedRoot || detectedRoot}`);
-      } else {
-        logComfyLine(`Detected existing ComfyUI install: ${managedRoot || detectedRoot}`);
+      if (emitDetectionLog) {
+        logComfyLine(`Detected ComfyUI install: ${detectedRoot}`);
       }
       await refreshComfyRuntimeStatus();
-      if (state.comfyRuntimeRunning) {
+      if (emitDetectionLog && state.comfyRuntimeRunning) {
         logComfyLine("Detected running ComfyUI server. If you want to start a different one, stop this server first.");
       }
       return;
@@ -850,8 +1018,10 @@ async function syncComfyInstallSelection(selectedPath, persistInstallBase = true
     }
     const installs = await refreshExistingInstallations(normalizedSelected);
     if (installs.length > 0) {
-      state.comfyMode = "manage";
-      if (el.comfyMode) el.comfyMode.value = "manage";
+      if (!keepCurrentMode) {
+        state.comfyMode = "manage";
+        if (el.comfyMode) el.comfyMode.value = "manage";
+      }
       updateComfyModeUi();
       const latest = newestComfyInstall(installs) || installs[0];
       if (latest?.root) {
@@ -1159,6 +1329,43 @@ function formatVramMbToGb(vramMb) {
   return `${(value / 1024).toFixed(1)} GB VRAM`;
 }
 
+function smoothedReceived(item) {
+  const target = Math.max(0, Number(item.received || 0));
+  const now = Date.now();
+  if (!Number.isFinite(item.displayReceived)) item.displayReceived = 0;
+  if (!Number.isFinite(item.displayTs)) item.displayTs = now;
+  if (item.displayReceived > target) item.displayReceived = target;
+
+  const dtMs = Math.max(16, now - item.displayTs);
+  item.displayTs = now;
+  const delta = target - item.displayReceived;
+  if (delta <= 0) return item.displayReceived;
+
+  const minStep = 128 * 1024;
+  const easedStep = delta * 0.25;
+  const rateCapStep = (dtMs / 1000) * (320 * 1024 * 1024);
+  const advance = Math.min(
+    delta,
+    Math.max(minStep, Math.min(rateCapStep, Math.max(minStep, easedStep))),
+  );
+  item.displayReceived += advance;
+  return item.displayReceived;
+}
+
+function ensureProgressSmoother() {
+  if (progressSmoothTimer) return;
+  progressSmoothTimer = window.setInterval(() => {
+    const active = [...state.transfers.values()].filter((x) => x.phase !== "finished" && x.phase !== "failed");
+    if (!active.length && state.busyDownloads <= 0) {
+      window.clearInterval(progressSmoothTimer);
+      progressSmoothTimer = null;
+      return;
+    }
+    renderActiveTransfers();
+    renderOverallProgress();
+  }, 140);
+}
+
 function renderOverallProgress() {
   const active = [...state.transfers.values()].filter((x) => x.phase !== "finished" && x.phase !== "failed");
   const busyOnly = state.busyDownloads > 0 && active.length === 0;
@@ -1174,6 +1381,16 @@ function renderOverallProgress() {
   el.overallProgress.classList.remove("hidden");
   el.overallProgressMeta.classList.remove("hidden");
 
+  const lead = active[0];
+  if (lead) {
+    const leadSize = Number(lead.size || 0);
+    const leadShown = leadSize > 0
+      ? Math.min(smoothedReceived(lead), leadSize)
+      : smoothedReceived(lead);
+    const leadPct = leadSize > 0 ? ` ${Math.round((leadShown / leadSize) * 100)}%` : "";
+    setProgress(`[${lead.kind || "download"}] ${lead.artifact || "file"}${leadPct}`);
+  }
+
   const known = active.filter((x) => Number(x.size || 0) > 0);
   if (!known.length) {
     el.overallProgress.classList.add("indeterminate");
@@ -1184,7 +1401,7 @@ function renderOverallProgress() {
   }
 
   const totalBytes = known.reduce((sum, x) => sum + Number(x.size || 0), 0);
-  const receivedBytes = known.reduce((sum, x) => sum + Math.min(Number(x.received || 0), Number(x.size || 0)), 0);
+  const receivedBytes = known.reduce((sum, x) => sum + Math.min(smoothedReceived(x), Number(x.size || 0)), 0);
   const pct = totalBytes > 0 ? Math.max(0, Math.min(100, Math.round((receivedBytes / totalBytes) * 100))) : 0;
   const unknownCount = Math.max(0, active.length - known.length);
 
@@ -1198,11 +1415,18 @@ function renderOverallProgress() {
 function beginBusyDownload(label) {
   state.busyDownloads += 1;
   if (!state.activeDownloadKind) {
-    state.activeDownloadKind = state.activeTab === "loras" ? "lora" : "model";
+    if (state.activeTab === "loras") {
+      state.activeDownloadKind = "lora";
+    } else if (state.activeTab === "workflows") {
+      state.activeDownloadKind = "workflow";
+    } else {
+      state.activeDownloadKind = "model";
+    }
   }
   setProgress(label || "Downloading...");
   updateDownloadButtons();
   renderOverallProgress();
+  ensureProgressSmoother();
 }
 
 function endBusyDownload() {
@@ -1220,9 +1444,11 @@ function updateDownloadButtons() {
   if (cancelling) {
     el.downloadModel.textContent = "Cancel Download";
     el.downloadLora.textContent = "Cancel Download";
+    el.downloadWorkflow.textContent = "Cancel Download";
   } else {
     el.downloadModel.textContent = "Download Model Assets";
     el.downloadLora.textContent = "Download LoRA";
+    el.downloadWorkflow.textContent = "Download Workflow";
   }
 }
 
@@ -1244,6 +1470,7 @@ async function requestCancelDownload() {
 }
 
 function renderActiveTransfers() {
+  const now = Date.now();
   const active = [...state.transfers.values()].filter((x) => x.phase !== "finished" && x.phase !== "failed");
   el.transferList.innerHTML = "";
   if (!active.length) {
@@ -1253,7 +1480,13 @@ function renderActiveTransfers() {
     el.transferList.appendChild(msg);
   }
   for (const item of active) {
-    const pct = item.size > 0 ? Math.max(0, Math.min(100, Math.round((item.received / item.size) * 100))) : 0;
+    const smoothed = smoothedReceived(item);
+    const shownReceived = item.size > 0 ? Math.min(smoothed, item.size) : smoothed;
+    const pct = item.size > 0 ? Math.max(0, Math.min(100, Math.round((shownReceived / item.size) * 100))) : 0;
+    const quietMs = now - Number(item.lastUpdateTs || now);
+    const nearEnd = item.size > 0 && shownReceived >= item.size * 0.9;
+    const finalizing = item.phase === "progress" && nearEnd && quietMs > 2500;
+    const phaseLabel = finalizing ? "finalizing" : item.phase;
     const row = document.createElement("div");
     row.className = "transfer-item";
     const title = document.createElement("div");
@@ -1267,8 +1500,8 @@ function renderActiveTransfers() {
     const sub = document.createElement("div");
     sub.className = "transfer-sub";
     sub.textContent = item.size
-      ? `${item.phase}${DOT_SEP}${formatBytes(item.received)} / ${formatBytes(item.size)}`
-      : item.phase;
+      ? `${phaseLabel}${DOT_SEP}${formatBytes(shownReceived)} / ${formatBytes(item.size)}`
+      : phaseLabel;
     row.appendChild(title);
     row.appendChild(bar);
     row.appendChild(sub);
@@ -1361,12 +1594,15 @@ function switchTab(tab) {
   const comfyui = tab === "comfyui";
   const models = tab === "models";
   const loras = tab === "loras";
+  const workflows = tab === "workflows";
   el.tabComfyui.classList.toggle("active", comfyui);
   el.tabModels.classList.toggle("active", models);
   el.tabLoras.classList.toggle("active", loras);
+  el.tabWorkflows.classList.toggle("active", workflows);
   el.contentComfyui.classList.toggle("hidden", !comfyui);
   el.contentModels.classList.toggle("hidden", !models);
   el.contentLoras.classList.toggle("hidden", !loras);
+  el.contentWorkflows.classList.toggle("hidden", !workflows);
   el.downloadsStatusPanel.classList.toggle("hidden", comfyui);
 }
 
@@ -1378,6 +1614,11 @@ function familyOptions(models) {
 function loraFamilyOptions(loras) {
   const families = [...new Set(loras.map((l) => l.family).filter(Boolean))].sort();
   return [{ value: "all", label: "All LoRA Families" }, ...families.map((f) => ({ value: f, label: f }))];
+}
+
+function workflowFamilyOptions(workflows) {
+  const families = [...new Set((workflows || []).map((w) => w.family).filter(Boolean))].sort();
+  return [{ value: "all", label: "All Workflow Families" }, ...families.map((f) => ({ value: f, label: f }))];
 }
 
 function refreshModelSelectors() {
@@ -1406,6 +1647,67 @@ function refreshLoraSelectors() {
   const filtered = state.catalog.loras.filter((l) => family === "all" || l.family === family);
   const options = filtered.map((l) => ({ value: l.id, label: l.display_name }));
   setOptions(el.loraId, options);
+}
+
+function refreshWorkflowSelectors() {
+  if (!state.catalog) return;
+  const family = el.workflowFamily.value || "all";
+  const filtered = (state.catalog.workflows || []).filter((w) => family === "all" || w.family === family);
+  const options = filtered.map((w) => ({ value: w.id, label: w.display_name }));
+  setOptions(el.workflowId, options);
+  loadWorkflowPreview();
+}
+
+function loadWorkflowPreview() {
+  const selectedId = String(el.workflowId?.value || "").trim();
+  const workflow = (state.catalog?.workflows || []).find((w) => w.id === selectedId);
+  if (!workflow) {
+    if (el.workflowPreviewImage) {
+      el.workflowPreviewImage.classList.add("hidden");
+      el.workflowPreviewImage.removeAttribute("src");
+    }
+    if (el.workflowPreviewCaption) {
+      el.workflowPreviewCaption.textContent = "No workflow preview loaded.";
+    }
+    if (el.workflowYoutubeLink) {
+      el.workflowYoutubeLink.textContent = "-";
+      el.workflowYoutubeLink.setAttribute("href", "#");
+      el.workflowYoutubeLink.style.pointerEvents = "none";
+    }
+    return;
+  }
+
+  const previewUrl = String(workflow.preview_image_url || "").trim();
+  if (!previewUrl) {
+    if (el.workflowPreviewImage) {
+      el.workflowPreviewImage.classList.add("hidden");
+      el.workflowPreviewImage.removeAttribute("src");
+    }
+    if (el.workflowPreviewCaption) {
+      el.workflowPreviewCaption.textContent = "No preview image available for this workflow.";
+    }
+    return;
+  }
+
+  if (el.workflowPreviewImage) {
+    el.workflowPreviewImage.src = previewUrl;
+    el.workflowPreviewImage.classList.remove("hidden");
+  }
+  if (el.workflowPreviewCaption) {
+    el.workflowPreviewCaption.textContent = workflow.display_name || "Workflow preview";
+  }
+  if (el.workflowYoutubeLink) {
+    const youtubeUrl = String(workflow.youtube_url || "").trim();
+    if (youtubeUrl) {
+      el.workflowYoutubeLink.textContent = "Link";
+      el.workflowYoutubeLink.setAttribute("href", youtubeUrl);
+      el.workflowYoutubeLink.style.pointerEvents = "auto";
+    } else {
+      el.workflowYoutubeLink.textContent = "-";
+      el.workflowYoutubeLink.setAttribute("href", "#");
+      el.workflowYoutubeLink.style.pointerEvents = "none";
+    }
+  }
 }
 
 async function loadLoraMetadata() {
@@ -1466,6 +1768,7 @@ async function bootstrap() {
     logLine("Tauri invoke bridge unavailable.");
     return;
   }
+  setStartupStatus("Loading settings and catalog...");
   const [settings, catalog] = await Promise.all([
     invoke("get_settings"),
     invoke("get_catalog"),
@@ -1501,7 +1804,23 @@ async function bootstrap() {
 
   el.comfyRoot.value = settings.comfyui_root || "";
   el.comfyRootLora.value = settings.comfyui_root || "";
+  if (el.comfyRootWorkflow) {
+    el.comfyRootWorkflow.value = settings.comfyui_root || "";
+  }
   el.comfyInstallRoot.value = settings.comfyui_install_base || "";
+  state.sharedModelsRootDefault = String(settings.shared_models_root || "").trim();
+  state.sharedModelsUseDefault = Boolean(
+    settings.shared_models_use_default
+    || (state.sharedModelsRootDefault && settings.shared_models_use_default !== false),
+  );
+  if (el.comfyExtraModelRoot) {
+    el.comfyExtraModelRoot.value = state.sharedModelsRootDefault;
+  }
+  if (el.comfyExtraModelDefault) {
+    el.comfyExtraModelDefault.checked = state.sharedModelsRootDefault
+      ? Boolean(state.sharedModelsUseDefault)
+      : false;
+  }
   if (el.comfyMode) {
     state.comfyMode = (settings.comfyui_root ? "manage" : "install");
     el.comfyMode.value = state.comfyMode;
@@ -1510,15 +1829,24 @@ async function bootstrap() {
   if (el.addonPinnedMemory) {
     el.addonPinnedMemory.checked = settings.comfyui_pinned_memory_enabled !== false;
   }
+  if (el.enableHfXet) {
+    el.enableHfXet.checked = settings.hf_xet_enabled === true;
+  }
   setComfyQuickActions(settings.comfyui_last_install_dir || "", settings.comfyui_root || "");
   setOptions(el.comfyTorchProfile, comfyTorchProfiles);
+  const savedTorchProfile = String(settings.comfyui_torch_profile || "").trim();
+  if (savedTorchProfile && comfyTorchProfiles.some((x) => x.value === savedTorchProfile)) {
+    el.comfyTorchProfile.value = savedTorchProfile;
+    state.comfyTorchProfileLocked = true;
+  }
 
   const refreshRecommendation = (attempt = 0) => {
     invoke("get_comfyui_install_recommendation")
       .then((reco) => {
-        el.comfyTorchRecommended.textContent = `Recommended '${reco.torch_label}' for your GPU`;
+        state.comfyTorchRecommendedBase = `Recommended '${reco.torch_label}' for your GPU`;
+        setTorchRecommendedDetecting(false);
         state.comfySage3Eligible = String(reco.gpu_name || "").toLowerCase().includes("rtx 50");
-        if (comfyTorchProfiles.some((x) => x.value === reco.torch_profile)) {
+        if (!state.comfyTorchProfileLocked && comfyTorchProfiles.some((x) => x.value === reco.torch_profile)) {
           el.comfyTorchProfile.value = reco.torch_profile;
         }
         applyComfyAddonRules();
@@ -1527,8 +1855,11 @@ async function bootstrap() {
         }
       })
       .catch((err) => {
-        el.comfyTorchRecommended.textContent = "Recommended 'Torch 2.8.0 + cu128' for your GPU";
-        el.comfyTorchProfile.value = "torch280_cu128";
+        state.comfyTorchRecommendedBase = "Recommended 'Torch 2.8.0 + cu128' for your GPU";
+        setTorchRecommendedDetecting(false);
+        if (!state.comfyTorchProfileLocked) {
+          el.comfyTorchProfile.value = "torch280_cu128";
+        }
         state.comfySage3Eligible = false;
         applyComfyAddonRules();
         logComfyLine(`Recommendation detection failed: ${err}`);
@@ -1538,14 +1869,18 @@ async function bootstrap() {
 
   const initialInstallRoot = String(el.comfyInstallRoot?.value || "").trim();
   if (initialInstallRoot) {
+    setStartupStatus("Running startup preflight checks...");
     setTimeout(() => {
       runComfyPreflight().catch(() => {});
     }, 0);
   } else {
     renderPreflight(null);
   }
+  setStartupStatus("Scanning ComfyUI installations...");
   if (settings.comfyui_install_base) {
     let effectiveBase = normalizeSlashes(settings.comfyui_install_base);
+    el.comfyInstallRoot.value = effectiveBase;
+    await invoke("set_comfyui_install_base", { comfyuiInstallBase: effectiveBase }).catch(() => {});
     try {
       const inspection = await invoke("inspect_comfyui_path", { path: effectiveBase });
       const selectedNorm = normalizeSlashes(inspection?.selected || effectiveBase);
@@ -1566,7 +1901,7 @@ async function bootstrap() {
         }
       }
     } catch (_) {}
-    await syncComfyInstallSelection(effectiveBase, false);
+    await syncComfyInstallSelection(effectiveBase, false, true, false);
   } else if (settings.comfyui_root) {
     const inferredBase = parentDir(settings.comfyui_root);
     el.comfyInstallRoot.value = inferredBase;
@@ -1576,6 +1911,7 @@ async function bootstrap() {
     await refreshExistingInstallations("", null);
   }
   await refreshComfyResumeState();
+  setStartupStatus("Checking ComfyUI runtime status...");
   await refreshComfyRuntimeStatus();
   updateComfyModeUi();
   setTimeout(() => {
@@ -1593,12 +1929,24 @@ async function bootstrap() {
     loadLoraMetadata().catch(() => {});
   }, 0);
 
-  logLine(`Loaded ${catalog.models?.length || 0} models and ${catalog.loras?.length || 0} LoRAs.`);
+  setOptions(el.workflowFamily, workflowFamilyOptions(catalog.workflows || []));
+  refreshWorkflowSelectors();
+
+  logLine(`Loaded ${catalog.models?.length || 0} models, ${catalog.loras?.length || 0} LoRAs, and ${catalog.workflows?.length || 0} workflows.`);
+  try {
+    setStartupStatus("Checking downloader acceleration...");
+    const xet = await invoke("get_hf_xet_preflight");
+    if (xet?.detail) {
+      logLine(xet.detail);
+    }
+  } catch (_) {}
+  setStartupStatus("Starting UI...");
 }
 
 el.tabComfyui.addEventListener("click", () => switchTab("comfyui"));
 el.tabModels.addEventListener("click", () => switchTab("models"));
 el.tabLoras.addEventListener("click", () => switchTab("loras"));
+el.tabWorkflows.addEventListener("click", () => switchTab("workflows"));
 
 el.modelFamily.addEventListener("change", refreshModelSelectors);
 el.modelId.addEventListener("change", refreshModelSelectors);
@@ -1611,11 +1959,16 @@ el.loraFamily.addEventListener("change", () => {
 el.loraId.addEventListener("change", () => {
   loadLoraMetadata().catch((err) => logLine(String(err)));
 });
+el.workflowFamily.addEventListener("change", refreshWorkflowSelectors);
+el.workflowId.addEventListener("change", loadWorkflowPreview);
 
 el.saveRoot.addEventListener("click", async () => {
   try {
     await invoke("set_comfyui_root", { comfyuiRoot: el.comfyRoot.value });
     el.comfyRootLora.value = el.comfyRoot.value;
+    if (el.comfyRootWorkflow) {
+      el.comfyRootWorkflow.value = el.comfyRoot.value;
+    }
     await loadInstalledAddonState(el.comfyRoot.value);
     const original = el.saveRoot.textContent;
     el.saveRoot.textContent = "Saved";
@@ -1636,6 +1989,9 @@ el.chooseRoot.addEventListener("click", async () => {
     el.comfyRoot.value = selected;
     await invoke("set_comfyui_root", { comfyuiRoot: selected });
     el.comfyRootLora.value = selected;
+    if (el.comfyRootWorkflow) {
+      el.comfyRootWorkflow.value = selected;
+    }
     logLine("ComfyUI folder selected.");
     await loadInstalledAddonState(selected);
   } catch (err) {
@@ -1647,6 +2003,9 @@ el.saveRootLora.addEventListener("click", async () => {
   try {
     await invoke("set_comfyui_root", { comfyuiRoot: el.comfyRootLora.value });
     el.comfyRoot.value = el.comfyRootLora.value;
+    if (el.comfyRootWorkflow) {
+      el.comfyRootWorkflow.value = el.comfyRootLora.value;
+    }
     await loadInstalledAddonState(el.comfyRoot.value);
     const original = el.saveRootLora.textContent;
     el.saveRootLora.textContent = "Saved";
@@ -1667,6 +2026,42 @@ el.chooseRootLora.addEventListener("click", async () => {
     el.comfyRootLora.value = selected;
     await invoke("set_comfyui_root", { comfyuiRoot: selected });
     el.comfyRoot.value = selected;
+    if (el.comfyRootWorkflow) {
+      el.comfyRootWorkflow.value = selected;
+    }
+    logLine("ComfyUI folder selected.");
+    await loadInstalledAddonState(selected);
+  } catch (err) {
+    logLine(`Choose folder failed: ${err}`);
+  }
+});
+
+el.saveRootWorkflow?.addEventListener("click", async () => {
+  try {
+    await invoke("set_comfyui_root", { comfyuiRoot: el.comfyRootWorkflow.value });
+    el.comfyRoot.value = el.comfyRootWorkflow.value;
+    el.comfyRootLora.value = el.comfyRootWorkflow.value;
+    await loadInstalledAddonState(el.comfyRoot.value);
+    const original = el.saveRootWorkflow.textContent;
+    el.saveRootWorkflow.textContent = "Saved";
+    el.saveRootWorkflow.disabled = true;
+    window.setTimeout(() => {
+      el.saveRootWorkflow.textContent = original || "Save Folder";
+      el.saveRootWorkflow.disabled = false;
+    }, 900);
+  } catch (err) {
+    logLine(`Save folder failed: ${err}`);
+  }
+});
+
+el.chooseRootWorkflow?.addEventListener("click", async () => {
+  try {
+    const selected = await invoke("pick_folder");
+    if (!selected) return;
+    el.comfyRootWorkflow.value = selected;
+    await invoke("set_comfyui_root", { comfyuiRoot: selected });
+    el.comfyRoot.value = selected;
+    el.comfyRootLora.value = selected;
     logLine("ComfyUI folder selected.");
     await loadInstalledAddonState(selected);
   } catch (err) {
@@ -1681,7 +2076,7 @@ el.saveInstallRoot.addEventListener("click", async () => {
     el.saveInstallRoot.textContent = "Saved";
     el.saveInstallRoot.disabled = true;
     window.setTimeout(() => {
-      el.saveInstallRoot.textContent = original || "Save Folder";
+      el.saveInstallRoot.textContent = original || "Save Base";
       el.saveInstallRoot.disabled = false;
     }, 900);
     await refreshComfyResumeState();
@@ -1702,10 +2097,79 @@ el.chooseInstallRoot.addEventListener("click", async () => {
   }
 });
 
+el.chooseExtraModelRoot?.addEventListener("click", async () => {
+  try {
+    const selected = await invoke("pick_folder");
+    if (!selected) return;
+    if (el.comfyExtraModelRoot) {
+      el.comfyExtraModelRoot.value = selected;
+    }
+    if (el.comfyExtraModelDefault) {
+      el.comfyExtraModelDefault.checked = true;
+    }
+    state.sharedModelsRootDefault = String(selected || "").trim();
+    state.sharedModelsUseDefault = true;
+    if (state.comfyMode === "manage") {
+      await persistComfyExtraModelConfigForRoot(el.comfyExistingInstall?.value || el.comfyRoot.value);
+    }
+    logComfyLine("Optional extra models folder selected.");
+  } catch (err) {
+    logComfyLine(`Choose extra models folder failed: ${err}`);
+  }
+});
+
+el.clearExtraModelRoot?.addEventListener("click", async () => {
+  if (el.comfyExtraModelRoot) {
+    el.comfyExtraModelRoot.value = "";
+  }
+  if (el.comfyExtraModelDefault) {
+    el.comfyExtraModelDefault.checked = false;
+  }
+  state.sharedModelsRootDefault = "";
+  state.sharedModelsUseDefault = false;
+  if (state.comfyMode === "manage") {
+    await persistComfyExtraModelConfigForRoot(el.comfyExistingInstall?.value || el.comfyRoot.value);
+  }
+  logComfyLine("Optional extra models folder cleared.");
+});
+
+el.comfyExtraModelDefault?.addEventListener("change", async () => {
+  const hasRoot = Boolean(String(el.comfyExtraModelRoot?.value || "").trim());
+  if (!hasRoot && el.comfyExtraModelDefault?.checked) {
+    el.comfyExtraModelDefault.checked = false;
+    return;
+  }
+  state.sharedModelsRootDefault = String(el.comfyExtraModelRoot?.value || "").trim();
+  state.sharedModelsUseDefault = Boolean(el.comfyExtraModelDefault?.checked && hasRoot);
+  if (state.comfyMode === "manage") {
+    await persistComfyExtraModelConfigForRoot(el.comfyExistingInstall?.value || el.comfyRoot.value);
+  }
+});
+
+el.comfyExtraModelRoot?.addEventListener("change", async () => {
+  const rootValue = String(el.comfyExtraModelRoot?.value || "").trim();
+  if (!rootValue && el.comfyExtraModelDefault?.checked) {
+    el.comfyExtraModelDefault.checked = false;
+  }
+  state.sharedModelsRootDefault = rootValue;
+  state.sharedModelsUseDefault = Boolean(el.comfyExtraModelDefault?.checked && rootValue);
+  if (state.comfyMode === "manage") {
+    await persistComfyExtraModelConfigForRoot(el.comfyExistingInstall?.value || el.comfyRoot.value);
+  }
+});
+
 el.comfyMode?.addEventListener("change", async () => {
   state.comfyMode = el.comfyMode.value === "manage" ? "manage" : "install";
   if (state.comfyMode !== "manage") {
     resetComfySelectionsToDefaults();
+    if (el.comfyExtraModelRoot) {
+      el.comfyExtraModelRoot.value = state.sharedModelsRootDefault || "";
+    }
+    if (el.comfyExtraModelDefault) {
+      el.comfyExtraModelDefault.checked = state.sharedModelsRootDefault
+        ? Boolean(state.sharedModelsUseDefault)
+        : false;
+    }
   } else {
     try {
       const installs = await refreshExistingInstallations(el.comfyInstallRoot?.value || "", null);
@@ -1750,7 +2214,23 @@ el.comfyExistingInstall?.addEventListener("change", async () => {
     refreshComfyUiUpdateStatus("").catch(() => {});
     return;
   }
+  const previousRoot = String(el.comfyRoot?.value || "").trim();
+  const switchingInstall = previousRoot
+    && normalizeSlashes(previousRoot) !== normalizeSlashes(selectedRoot);
   try {
+    if (state.comfyMode === "manage" && switchingInstall) {
+      await refreshComfyRuntimeStatus().catch(() => {});
+      if (state.comfyRuntimeRunning) {
+        logComfyLine("ComfyUI server is running. Stopping it before switching managed install...");
+        await invoke("stop_comfyui_root");
+        await refreshComfyRuntimeStatus().catch(() => {});
+        if (state.comfyRuntimeRunning) {
+          logComfyLine("ComfyUI is still running. Stop it first, then switch install.");
+          return;
+        }
+        logComfyLine("ComfyUI server stopped.");
+      }
+    }
     await applySelectedExistingInstallation(selectedRoot);
     if (state.comfyMode === "manage") {
       logComfyLine(`Now managing: ${selectedRoot}`);
@@ -1845,7 +2325,10 @@ el.nodeComfyuiCrystools?.addEventListener("change", () => {
   applyComponentToggleFromCheckbox(el.nodeComfyuiCrystools, "node_comfyui_crystools", "comfyui-crystools")
     .catch((err) => logComfyLine(String(err)));
 });
-el.comfyTorchProfile?.addEventListener("change", () => applyComfyAddonRules());
+el.comfyTorchProfile?.addEventListener("change", () => {
+  state.comfyTorchProfileLocked = true;
+  applyComfyAddonRules();
+});
 el.runPreflight?.addEventListener("click", () => {
   runComfyPreflight().then((result) => {
     if (!result) return;
@@ -1863,10 +2346,12 @@ el.comfyClearInstallLog?.addEventListener("click", () => {
   if (el.comfyInstallLog) el.comfyInstallLog.textContent = "Ready";
 });
 
+el.clearStatusLog?.addEventListener("click", () => {
+  if (el.statusLog) el.statusLog.textContent = "Ready";
+});
+
 el.comfyOpenInstallFolder?.addEventListener("click", async () => {
-  const path = String(
-    el.comfyExistingInstall?.value || el.comfyRoot?.value || el.comfyOpenInstallFolder.dataset.path || "",
-  ).trim();
+  const path = String(el.comfyOpenInstallFolder.dataset.path || "").trim();
   if (!path) return;
   try {
     await invoke("open_folder", { path });
@@ -1876,16 +2361,11 @@ el.comfyOpenInstallFolder?.addEventListener("click", async () => {
 });
 
 el.comfyStartInstalled?.addEventListener("click", async () => {
-  const path = String(
-    el.comfyExistingInstall?.value || el.comfyRoot?.value || el.comfyStartInstalled.dataset.path || "",
-  ).trim();
+  const preferredManageRoot = state.comfyMode === "manage"
+    ? String(el.comfyExistingInstall?.value || "").trim()
+    : "";
+  const path = String(preferredManageRoot || el.comfyStartInstalled.dataset.path || "").trim();
   if (!path) return;
-  if (el.comfyStartInstalled) {
-    el.comfyStartInstalled.dataset.path = path;
-  }
-  if (el.comfyOpenInstallFolder) {
-    el.comfyOpenInstallFolder.dataset.path = path;
-  }
   try {
     if (state.comfyRuntimeRunning) {
       state.comfyRuntimeStarting = false;
@@ -1984,6 +2464,20 @@ el.metaCreatorLink.addEventListener("click", async (event) => {
   }
 });
 
+el.workflowYoutubeLink?.addEventListener("click", async (event) => {
+  const href = el.workflowYoutubeLink.getAttribute("href") || "";
+  if (!href || href === "#") {
+    event.preventDefault();
+    return;
+  }
+  event.preventDefault();
+  try {
+    await invoke("open_external_url", { url: href });
+  } catch (err) {
+    logLine(`Open workflow tutorial link failed: ${err}`);
+  }
+});
+
 document.querySelectorAll(".footer-link[data-url]").forEach((button) => {
   button.addEventListener("click", async () => {
     const url = button.getAttribute("data-url");
@@ -2032,6 +2526,7 @@ async function initEventListeners() {
     const key = `${p.kind || "download"}:${p.index || "?"}:${p.artifact || "item"}`;
     const current = state.transfers.get(key) || {
       id: key,
+      kind: p.kind || "download",
       artifact: p.artifact || "artifact",
       phase: "started",
       received: 0,
@@ -2039,8 +2534,20 @@ async function initEventListeners() {
       folder: "",
     };
     current.phase = p.phase || current.phase;
+    if (p.kind) current.kind = p.kind;
+    current.lastUpdateTs = Date.now();
     if (p.artifact) current.artifact = p.artifact;
-    if (p.received != null) current.received = Number(p.received);
+    if (p.received != null) {
+      const nextReceived = Number(p.received || 0);
+      const prevReceived = Number(current.received || 0);
+      current.received = Number.isFinite(nextReceived)
+        ? Math.max(prevReceived, nextReceived)
+        : prevReceived;
+    }
+    if (p.phase === "started") {
+      current.displayReceived = 0;
+      current.displayTs = Date.now();
+    }
     if (p.size != null) current.size = Number(p.size);
     if (typeof p.folder === "string" && p.folder.trim()) current.folder = p.folder.trim();
     state.transfers.set(key, current);
@@ -2048,10 +2555,7 @@ async function initEventListeners() {
     if (p.phase === "started") {
       setProgress(`[${p.kind}] ${p.index || "?"}/${p.total || "?"} ${p.artifact || ""}`);
     } else if (p.phase === "progress") {
-      const received = Number(p.received || 0);
-      const size = Number(p.size || 0);
-      const pct = size > 0 ? ` ${Math.round((received / size) * 100)}%` : "";
-      setProgress(`[${p.kind}] ${p.artifact || ""}${pct}`);
+      ensureProgressSmoother();
     } else if (p.phase === "failed") {
       setProgress(`[${p.kind}] failed: ${p.message || "unknown error"}`);
       logLine(`[${p.kind}] ${p.artifact || "download"} failed: ${p.message || "unknown error"}`);
@@ -2108,23 +2612,26 @@ async function initEventListeners() {
         updateComfyInstallButton();
         el.comfyResumeBanner?.classList.add("hidden");
         if (typeof p.folder === "string" && p.folder.trim()) {
-          const installedRoot = p.folder.trim();
-          const installDir = String(p.artifact || "").trim();
-          el.comfyRoot.value = installedRoot;
-          el.comfyRootLora.value = installedRoot;
-          if (installDir) {
-            el.comfyInstallRoot.value = installDir;
-            invoke("set_comfyui_install_base", { comfyuiInstallBase: installDir }).catch(() => {});
-          }
-          setComfyQuickActions(installDir, installedRoot);
-          invoke("set_comfyui_root", { comfyuiRoot: installedRoot }).catch((err) => {
-            logComfyLine(`Failed to auto-set ComfyUI root: ${err}`);
+          const installedRoot = normalizeSlashes(p.folder.trim());
+          const emittedBase = normalizeSlashes(String(p.artifact || "").trim());
+          const installBase = emittedBase || parentDir(installedRoot) || installedRoot;
+
+          const finalizeInstalledSelection = async () => {
+            await syncComfyInstallSelection(installedRoot, true);
+            state.comfyMode = "manage";
+            if (el.comfyMode) el.comfyMode.value = "manage";
+            await refreshExistingInstallations(installBase, installedRoot).catch(() => []);
+            await applySelectedExistingInstallation(installedRoot).catch(() => {});
+            await refreshComfyUiUpdateStatus(installedRoot).catch(() => {});
+            setComfyQuickActions(installBase, installedRoot);
+            await refreshComfyRuntimeStatus().catch(() => {});
+            updateComfyModeUi();
+          };
+
+          finalizeInstalledSelection().catch((err) => {
+            logComfyLine(`Failed to finalize installed ComfyUI selection: ${err}`);
+            updateComfyModeUi();
           });
-          loadInstalledAddonState(installedRoot).catch(() => {});
-          refreshExistingInstallations(installDir, installedRoot).catch(() => {});
-          state.comfyMode = "manage";
-          if (el.comfyMode) el.comfyMode.value = "manage";
-          updateComfyModeUi();
         }
         return;
       }
@@ -2144,18 +2651,22 @@ async function initEventListeners() {
         updateComfyRuntimeButton();
         return;
       }
-      if (phase === "started") {
-        state.comfyRuntimeTarget = "";
-        state.comfyRuntimeStarting = false;
-        state.comfyRuntimeRunning = true;
-        updateComfyRuntimeButton();
-        refreshComfyRuntimeStatus().catch(() => {});
-        return;
-      }
-      if (phase === "stopped" || phase === "start_failed" || phase === "stop_failed") {
-        state.comfyRuntimeTarget = "";
-        state.comfyRuntimeStarting = false;
-        state.comfyRuntimeRunning = false;
+    if (phase === "started") {
+      state.comfyRuntimeTarget = "";
+      state.comfyRuntimeStarting = false;
+      state.comfyRuntimeRunning = true;
+      updateComfyRuntimeButton();
+      refreshComfyRuntimeStatus().catch(() => {});
+      return;
+    }
+    if (phase === "restarted_after_changes") {
+      openComfyWhenReady().catch(() => {});
+      return;
+    }
+    if (phase === "stopped" || phase === "start_failed" || phase === "stop_failed") {
+      state.comfyRuntimeTarget = "";
+      state.comfyRuntimeStarting = false;
+      state.comfyRuntimeRunning = false;
         updateComfyRuntimeButton();
         refreshComfyRuntimeStatus().catch(() => {});
       }
@@ -2189,6 +2700,32 @@ el.downloadModel.addEventListener("click", async () => {
   }
 });
 
+if (el.enableHfXet) {
+  el.enableHfXet.addEventListener("change", async () => {
+    const enabled = !!el.enableHfXet.checked;
+    el.enableHfXet.disabled = true;
+    try {
+      const updated = await invoke("set_hf_xet_enabled", { enabled });
+      state.settings = updated;
+      el.enableHfXet.checked = updated?.hf_xet_enabled === true;
+      if (enabled) {
+        logLine("HF Xet experimental mode enabled.");
+      } else {
+        logLine("HF Xet experimental mode disabled. Using default downloader.");
+      }
+      try {
+        const xet = await invoke("get_hf_xet_preflight");
+        if (xet?.detail) logLine(xet.detail);
+      } catch (_) {}
+    } catch (err) {
+      logLine(`HF Xet toggle failed: ${err}`);
+      el.enableHfXet.checked = !enabled;
+    } finally {
+      el.enableHfXet.disabled = false;
+    }
+  });
+}
+
 el.downloadLora.addEventListener("click", async () => {
   if (state.busyDownloads > 0) {
     await requestCancelDownload();
@@ -2211,6 +2748,28 @@ el.downloadLora.addEventListener("click", async () => {
   }
 });
 
+el.downloadWorkflow?.addEventListener("click", async () => {
+  if (state.busyDownloads > 0) {
+    await requestCancelDownload();
+    return;
+  }
+  if (!el.workflowId.value) {
+    logLine("Select a workflow first.");
+    return;
+  }
+  beginBusyDownload("Starting workflow download...");
+  try {
+    await invoke("download_workflow_asset", {
+      workflowId: el.workflowId.value,
+      comfyuiRoot: el.comfyRootWorkflow?.value || el.comfyRoot.value,
+    });
+    logLine("Workflow download started.");
+  } catch (err) {
+    logLine(String(err));
+    endBusyDownload();
+  }
+});
+
 switchTab("comfyui");
 updateDownloadButtons();
 updateComfyInstallButton();
@@ -2220,9 +2779,12 @@ updateUpdateButton();
 renderTransfers();
 
 (async () => {
+  setStartupStatus("Connecting event listeners...");
   await initEventListeners();
   try {
+    setStartupStatus("Preparing workspace...");
     await bootstrap();
+    hideStartupOverlay();
     setTimeout(() => {
       invoke("check_updates_now")
         .then((startup) => {
@@ -2244,20 +2806,12 @@ renderTransfers();
     }, 0);
   } catch (err) {
     logLine(`Initialization failed: ${err}`);
+    setStartupStatus(`Startup error: ${err}`);
+    window.setTimeout(() => {
+      hideStartupOverlay();
+    }, 900);
   }
 })();
 
 // Runtime status polling (low-overhead, non-overlapping) to avoid UI hitching.
 scheduleRuntimeStatusPoll(1800);
-
-
-
-
-
-
-
-
-
-
-
-

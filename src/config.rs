@@ -9,8 +9,6 @@ use std::{
 };
 
 const SETTINGS_FILE: &str = "settings.json";
-const LEGACY_REMOTE_CATALOG_URL: &str =
-    "https://raw.githubusercontent.com/ArcticLatent/ArcticDownloader-flatpak/refs/heads/main/data/catalog.json";
 const FALLBACK_REMOTE_CATALOG_URL: &str =
     "https://raw.githubusercontent.com/ArcticLatent/Arctic-Helper/refs/heads/main/assets/catalog.json";
 
@@ -25,8 +23,8 @@ pub struct ConfigStore {
 
 impl ConfigStore {
     pub fn new() -> Result<Self> {
-        let base =
-            BaseDirs::new().ok_or_else(|| anyhow!("unable to resolve base directories for {APP_ID}"))?;
+        let base = BaseDirs::new()
+            .ok_or_else(|| anyhow!("unable to resolve base directories for {APP_ID}"))?;
         let root_dir = base.data_local_dir().join(APP_ID);
         let config_dir = root_dir.join("config");
         let state_dir = root_dir.join("state");
@@ -55,9 +53,6 @@ impl ConfigStore {
         if settings.catalog_endpoint.is_none() {
             settings.catalog_endpoint = default_catalog_endpoint();
             persist_defaults = settings_path.exists();
-        } else if settings.catalog_endpoint.as_deref() == Some(LEGACY_REMOTE_CATALOG_URL) {
-            settings.catalog_endpoint = default_catalog_endpoint();
-            persist_defaults = true;
         }
 
         let store = Self {
@@ -142,6 +137,14 @@ pub struct AppSettings {
     pub comfyui_pinned_memory_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comfyui_attention_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comfyui_torch_profile: Option<String>,
+    #[serde(default)]
+    pub hf_xet_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_models_root: Option<PathBuf>,
+    #[serde(default)]
+    pub shared_models_use_default: bool,
 }
 
 impl AppSettings {
@@ -167,6 +170,10 @@ impl Default for AppSettings {
             last_installed_version: None,
             comfyui_pinned_memory_enabled: true,
             comfyui_attention_backend: None,
+            comfyui_torch_profile: None,
+            hf_xet_enabled: false,
+            shared_models_root: None,
+            shared_models_use_default: false,
         }
     }
 }
