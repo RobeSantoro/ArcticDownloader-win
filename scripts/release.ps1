@@ -81,9 +81,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $tauriCargo = Join-Path $root "src-tauri\Cargo.toml"
+$rootCargo = Join-Path $root "Cargo.toml"
 $tauriConf = Join-Path $root "src-tauri\tauri.conf.json"
 
 Write-Host "Updating versions to $Version ..."
+Update-CargoVersion -Path $rootCargo -NewVersion $Version
 Update-CargoVersion -Path $tauriCargo -NewVersion $Version
 $conf = Get-Content $tauriConf -Raw | ConvertFrom-Json
 $conf.version = $Version

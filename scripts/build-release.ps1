@@ -23,8 +23,27 @@ Set-Location $root
 
 $cargo = "cargo"
 $tauriManifest = Join-Path $root "src-tauri\Cargo.toml"
+$rootManifest = Join-Path $root "Cargo.toml"
 if (-not (Test-Path $tauriManifest)) {
     throw "Missing Tauri manifest at $tauriManifest"
+}
+if (-not (Test-Path $rootManifest)) {
+    throw "Missing root manifest at $rootManifest"
+}
+
+function Read-CargoVersion([string]$Path) {
+    $raw = Get-Content $Path -Raw
+    $m = [regex]::Match($raw, '(?m)^version\s*=\s*"([^"]+)"\s*$')
+    if (-not $m.Success) {
+        throw "Could not read version from $Path"
+    }
+    return $m.Groups[1].Value
+}
+
+$rootVersion = Read-CargoVersion $rootManifest
+$tauriVersion = Read-CargoVersion $tauriManifest
+if ($rootVersion -ne $Version -or $tauriVersion -ne $Version) {
+    throw "Version mismatch. Expected $Version, found root=$rootVersion tauri=$tauriVersion. Update both Cargo.toml files first."
 }
 
 Write-Host "Building release binary..."
