@@ -427,26 +427,27 @@ fn write_extra_model_paths_yaml(
     let base = yaml_single_quote(&strip_windows_verbatim_prefix(base_path).to_string_lossy());
     let default_value = if is_default { "true" } else { "false" };
     let yaml = format!(
-        "# Managed by Arctic ComfyUI Helper.\n\
-comfyui:\n\
-  base_path: {base}\n\
-  is_default: {default_value}\n\
-  checkpoints: models/checkpoints/\n\
-  text_encoders: |\n\
-    models/text_encoders/\n\
-    models/clip/\n\
-  clip_vision: models/clip_vision/\n\
-  configs: models/configs/\n\
-  controlnet: models/controlnet/\n\
-  diffusion_models: |\n\
-    models/diffusion_models/\n\
-    models/unet/\n\
-  embeddings: models/embeddings/\n\
-  loras: models/loras/\n\
-  upscale_models: models/upscale_models/\n\
-  vae: models/vae/\n\
-  audio_encoders: models/audio_encoders/\n\
-  model_patches: models/model_patches/\n"
+        r#"# Managed by Arctic ComfyUI Helper.
+comfyui:
+  base_path: {base}
+  is_default: {default_value}
+  checkpoints: models/checkpoints/
+  text_encoders: |
+    models/text_encoders/
+    models/clip/
+  clip_vision: models/clip_vision/
+  configs: models/configs/
+  controlnet: models/controlnet/
+  diffusion_models: |
+    models/diffusion_models/
+    models/unet/
+  embeddings: models/embeddings/
+  loras: models/loras/
+  upscale_models: models/upscale_models/
+  vae: models/vae/
+  audio_encoders: models/audio_encoders/
+  model_patches: models/model_patches/
+"#
     );
 
     std::fs::write(&target, yaml).map_err(|err| {

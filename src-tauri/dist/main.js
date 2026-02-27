@@ -26,8 +26,11 @@ const state = {
   comfyMode: "install",
   updateAvailable: false,
   updateVersion: null,
-  appVersion: "0.1.0",
+  appVersion: "",
   updateInstalling: false,
+  updateChecking: false,
+  updateFlashLabel: "",
+  updateFlashTimer: null,
   selectedComfyVersion: null,
   titleSystemText: "Loading system info...",
   comfyUpdateAvailable: false,
@@ -297,6 +300,10 @@ function waitForNextPaint() {
   });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 function setProgress(text) {
   el.progressLine.textContent = text || "Idle";
 }
@@ -332,8 +339,8 @@ function renderTitleMeta() {
 
 function renderAppVersionTag() {
   if (!el.appVersionTag) return;
-  const normalizeVersion = (value) => String(value || "0.1.0").trim().replace(/^v/i, "");
-  const current = normalizeVersion(state.appVersion || "0.1.0");
+  const normalizeVersion = (value) => String(value || "").trim().replace(/^v/i, "");
+  const current = normalizeVersion(state.appVersion || "");
   const latest = normalizeVersion(state.updateVersion || "");
   if (state.updateInstalling) {
     el.appVersionTag.textContent = "Updating...";
@@ -345,7 +352,7 @@ function renderAppVersionTag() {
     el.appVersionTag.classList.add("update-available");
     return;
   }
-  el.appVersionTag.textContent = current;
+  el.appVersionTag.textContent = current || "...";
   el.appVersionTag.classList.remove("update-available");
 }
 
@@ -380,6 +387,18 @@ function updateComfyUpdateButton() {
 function updateUpdateButton() {
   if (!el.checkUpdates) return;
   el.checkUpdates.classList.remove("update-available");
+  if (state.updateFlashLabel) {
+    el.checkUpdates.textContent = state.updateFlashLabel;
+    el.checkUpdates.disabled = true;
+    renderAppVersionTag();
+    return;
+  }
+  if (state.updateChecking) {
+    el.checkUpdates.textContent = "Checking...";
+    el.checkUpdates.disabled = true;
+    renderAppVersionTag();
+    return;
+  }
   if (state.updateInstalling) {
     el.checkUpdates.textContent = "Updating...";
     el.checkUpdates.disabled = true;
@@ -392,6 +411,20 @@ function updateUpdateButton() {
     el.checkUpdates.classList.add("update-available");
   }
   renderAppVersionTag();
+}
+
+function flashUpdateButton(label, durationMs = 2600) {
+  if (state.updateFlashTimer) {
+    window.clearTimeout(state.updateFlashTimer);
+    state.updateFlashTimer = null;
+  }
+  state.updateFlashLabel = String(label || "").trim();
+  updateUpdateButton();
+  state.updateFlashTimer = window.setTimeout(() => {
+    state.updateFlashLabel = "";
+    state.updateFlashTimer = null;
+    updateUpdateButton();
+  }, Math.max(600, Number(durationMs) || 2600));
 }
 
 function normalizeSlashes(value) {
@@ -1777,7 +1810,7 @@ async function bootstrap() {
   state.settings = settings;
   state.catalog = catalog;
 
-  state.appVersion = settings?.last_installed_version || "0.1.0";
+  state.appVersion = settings?.last_installed_version || state.appVersion || "";
   state.titleSystemText = "Loading system info...";
   renderAppVersionTag();
   renderTitleMeta();
@@ -2408,44 +2441,53 @@ el.saveToken.addEventListener("click", async () => {
 });
 
 el.checkUpdates.addEventListener("click", async () => {
-  if (state.updateInstalling) return;
+  if (state.updateInstalling || state.updateChecking) return;
   if (state.updateAvailable) {
     try {
       state.updateInstalling = true;
       updateUpdateButton();
-      el.updateStatus.textContent = state.updateVersion
-        ? `Installing v${state.updateVersion}...`
-        : "Installing update...";
       await invoke("auto_update_startup");
     } catch (err) {
       state.updateInstalling = false;
       updateUpdateButton();
-      el.updateStatus.textContent = "Error";
+      flashUpdateButton("Check Failed", 3200);
       logLine(String(err));
     }
     return;
   }
   try {
+    state.updateChecking = true;
+    updateUpdateButton();
+    const startedAt = Date.now();
     const result = await invoke("check_updates_now");
+    const checkingElapsed = Date.now() - startedAt;
+    if (checkingElapsed < 700) {
+      await sleep(700 - checkingElapsed);
+    }
+    state.updateChecking = false;
     if (result.available) {
       state.updateAvailable = true;
       state.updateVersion = result.version || null;
-      el.updateStatus.textContent = "New update available";
+      state.updateFlashLabel = "";
+      if (state.updateFlashTimer) {
+        window.clearTimeout(state.updateFlashTimer);
+        state.updateFlashTimer = null;
+      }
       updateUpdateButton();
       logLine(`Update available: v${result.version}`);
     } else {
       state.updateAvailable = false;
       state.updateVersion = null;
-      el.updateStatus.textContent = "Up to date";
-      updateUpdateButton();
+      flashUpdateButton("No Update", 4000);
       logLine("No updates available.");
     }
   } catch (err) {
+    state.updateChecking = false;
     state.updateAvailable = false;
     state.updateVersion = null;
     state.updateInstalling = false;
+    flashUpdateButton("Check Failed", 4000);
     updateUpdateButton();
-    el.updateStatus.textContent = "Error";
     logLine(String(err));
   }
 });

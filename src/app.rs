@@ -70,11 +70,6 @@ pub fn build_context() -> Result<AppContext> {
 }
 
 fn resolve_display_version(config: &ConfigStore) -> String {
-    if let Some(version) = config.settings().last_installed_version {
-        if !version.trim().is_empty() {
-            return version;
-        }
-    }
-
+    let _ = config;
     env!("CARGO_PKG_VERSION").to_string()
 }
