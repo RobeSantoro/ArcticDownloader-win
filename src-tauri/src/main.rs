@@ -48,6 +48,7 @@ struct AppSnapshot {
     ram_tier: Option<String>,
     nvidia_gpu_name: Option<String>,
     nvidia_gpu_vram_mb: Option<u64>,
+    amd_gpu_name: Option<String>,
     model_count: usize,
     lora_count: usize,
 }
@@ -198,6 +199,7 @@ fn default_true() -> bool {
 fn get_app_snapshot(state: State<'_, AppState>) -> AppSnapshot {
     let catalog = state.context.catalog.catalog_snapshot();
     let (nvidia_gpu_name, nvidia_gpu_vram_mb) = detect_nvidia_gpu();
+    let amd_gpu_name = detect_amd_gpu_name();
     let ram_profile = state.context.ram_profile.or_else(detect_ram_profile);
     AppSnapshot {
         version: state.context.display_version.clone(),
@@ -205,6 +207,7 @@ fn get_app_snapshot(state: State<'_, AppState>) -> AppSnapshot {
         ram_tier: ram_profile.map(|profile| profile.tier.label().to_string()),
         nvidia_gpu_name,
         nvidia_gpu_vram_mb,
+        amd_gpu_name,
         model_count: catalog.models.len(),
         lora_count: catalog.loras.len(),
     }
@@ -222,8 +225,15 @@ struct NvidiaGpuDetails {
     driver_version: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct AmdGpuDetails {
+    name: Option<String>,
+}
+
 static GPU_DETAILS_CACHE: OnceLock<Mutex<Option<NvidiaGpuDetails>>> = OnceLock::new();
 static GPU_DETAILS_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
+static AMD_GPU_DETAILS_CACHE: OnceLock<Mutex<Option<AmdGpuDetails>>> = OnceLock::new();
+static AMD_GPU_DETAILS_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 static TRAY_MENU_ITEMS: OnceLock<Mutex<Option<TrayMenuItems>>> = OnceLock::new();
 
 struct TrayMenuItems {
@@ -237,6 +247,10 @@ fn tray_menu_items() -> &'static Mutex<Option<TrayMenuItems>> {
 
 fn gpu_details_cache() -> &'static Mutex<Option<NvidiaGpuDetails>> {
     GPU_DETAILS_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn amd_gpu_details_cache() -> &'static Mutex<Option<AmdGpuDetails>> {
+    AMD_GPU_DETAILS_CACHE.get_or_init(|| Mutex::new(None))
 }
 
 fn query_nvidia_gpu_details_blocking() -> NvidiaGpuDetails {
@@ -304,10 +318,93 @@ fn detect_nvidia_gpu_details() -> NvidiaGpuDetails {
     NvidiaGpuDetails::default()
 }
 
+fn query_amd_gpu_details_blocking() -> AmdGpuDetails {
+    let script = "$gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'AMD|Radeon|Ryzen AI|RyzenAI|ATI' } | Select-Object -First 1 -ExpandProperty Name; if ($gpu) { $gpu }";
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]);
+    apply_background_command_flags(&mut cmd);
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(_) => return AmdGpuDetails::default(),
+    };
+    if !output.status.success() {
+        return AmdGpuDetails::default();
+    }
+    let name = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned);
+    AmdGpuDetails { name }
+}
+
+fn detect_amd_gpu_details() -> AmdGpuDetails {
+    if let Ok(guard) = amd_gpu_details_cache().lock() {
+        if let Some(details) = guard.clone() {
+            return details;
+        }
+    }
+
+    if !AMD_GPU_DETAILS_PROBE_STARTED.swap(true, Ordering::SeqCst) {
+        std::thread::spawn(|| {
+            let details = query_amd_gpu_details_blocking();
+            if let Ok(mut guard) = amd_gpu_details_cache().lock() {
+                if details.name.is_some() {
+                    *guard = Some(details);
+                } else {
+                    *guard = None;
+                    AMD_GPU_DETAILS_PROBE_STARTED.store(false, Ordering::SeqCst);
+                }
+            }
+        });
+    }
+
+    AmdGpuDetails::default()
+}
+
+fn detect_amd_gpu_name() -> Option<String> {
+    if fake_amd_enabled() {
+        return Some("Fake AMD GPU (simulation)".to_string());
+    }
+    detect_amd_gpu_details().name
+}
+
+fn windows_rocm_supported_gpu(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "radeon rx 9070",
+        "radeon rx 9060",
+        "radeon rx 7900",
+        "radeon rx 7800",
+        "radeon rx 7700",
+        "radeon ai pro r9700",
+        "ryzen ai max",
+        "ryzen ai 9 hx 370",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 #[tauri::command]
 fn get_comfyui_install_recommendation() -> ComfyInstallRecommendation {
     let gpu = detect_nvidia_gpu_details();
     let gpu_name = gpu.name.clone().unwrap_or_default().to_ascii_lowercase();
+    if let Some(amd_name) = detect_amd_gpu_name() {
+        let reason = if windows_rocm_supported_gpu(&amd_name) {
+            "Detected supported AMD GPU; selecting Windows ROCm install profile."
+                .to_string()
+        } else {
+            "Detected AMD GPU. Windows ROCm support is limited to specific Radeon and Ryzen AI hardware."
+                .to_string()
+        };
+        return ComfyInstallRecommendation {
+            gpu_name: Some(amd_name),
+            driver_version: None,
+            torch_profile: "torch291_rocm72".to_string(),
+            torch_label: "Torch 2.9.1 + ROCm SDK 7.2".to_string(),
+            reason,
+        };
+    }
     let driver_major = gpu
         .driver_version
         .as_deref()
@@ -650,6 +747,12 @@ fn apply_background_command_flags(cmd: &mut std::process::Command) {
 
 fn nerdstats_enabled() -> bool {
     std::env::var("ARCTIC_NERDSTATS")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn fake_amd_enabled() -> bool {
+    std::env::var("ARCTIC_FAKE_AMD")
         .map(|value| value == "1")
         .unwrap_or(false)
 }
@@ -1452,12 +1555,9 @@ fn run_command_capture(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if !output.status.success() {
-        let tail = if stderr.trim().is_empty() {
-            stdout.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
-        } else {
-            stderr.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
-        };
-        return Err(format!("Command failed: {} {} :: {}", program, args.join(" "), tail));
+        return Err(enrich_command_failure_message(
+            program, args, &stdout, &stderr,
+        ));
     }
     Ok((stdout, stderr))
 }
@@ -1484,6 +1584,169 @@ fn run_command_with_retry(
     Err(last_err)
 }
 
+fn enrich_command_failure_message(program: &str, args: &[&str], stdout: &str, stderr: &str) -> String {
+    let tail = if stderr.trim().is_empty() {
+        stdout
+            .lines()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        stderr
+            .lines()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    let msvc_hint = if combined.contains("microsoft visual c++ 14.0 or greater is required")
+        || combined.contains("msvc")
+        || combined.contains("visual studio build tools")
+        || combined.contains("unable to find vcvarsall.bat")
+    {
+        " Missing dependency: Microsoft Visual C++ Build Tools 14.0 or newer. Install Visual Studio Build Tools with the C++ build tools workload, then retry."
+    } else {
+        ""
+    };
+    if tail.trim().is_empty() {
+        format!("Command failed: {} {}.{}", program, args.join(" "), msvc_hint)
+    } else {
+        format!(
+            "Command failed: {} {} :: {}{}",
+            program,
+            args.join(" "),
+            tail,
+            msvc_hint
+        )
+    }
+}
+
+fn looks_like_missing_msvc_tools(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("microsoft visual c++ 14.0 or greater is required")
+        || lower.contains("visual studio build tools")
+        || lower.contains("unable to find vcvarsall.bat")
+        || lower.contains("error: microsoft visual c++")
+}
+
+fn powershell_single_quote(raw: &str) -> String {
+    raw.replace('\'', "''")
+}
+
+fn vswhere_path() -> Option<PathBuf> {
+    let candidate =
+        PathBuf::from(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe");
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn visual_cpp_build_tools_installed() -> bool {
+    let Some(vswhere) = vswhere_path() else {
+        return false;
+    };
+    let output = run_command_capture(
+        &vswhere.to_string_lossy(),
+        &[
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ],
+        None,
+    );
+    match output {
+        Ok((stdout, _)) => stdout.lines().any(|line| !line.trim().is_empty()),
+        Err(_) => false,
+    }
+}
+
+fn install_visual_cpp_build_tools(app: &AppHandle) -> Result<(), String> {
+    if visual_cpp_build_tools_installed() {
+        emit_install_event(app, "info", "Microsoft Visual C++ Build Tools already installed.");
+        return Ok(());
+    }
+
+    let state = app.state::<AppState>();
+    let deps_root = state.context.config.cache_path().join("deps").join("vs-build-tools");
+    std::fs::create_dir_all(&deps_root).map_err(|err| err.to_string())?;
+    let bootstrapper = deps_root.join("vs_BuildTools.exe");
+    let installer_log = deps_root.join("vs_buildtools_install.log");
+
+    emit_install_event(
+        app,
+        "step",
+        "Downloading Microsoft Visual C++ Build Tools bootstrapper...",
+    );
+    powershell_download("https://aka.ms/vs/17/release/vs_BuildTools.exe", &bootstrapper)?;
+
+    emit_install_event(
+        app,
+        "step",
+        "Installing Microsoft Visual C++ Build Tools automatically...",
+    );
+
+    let bootstrapper_s = powershell_single_quote(&bootstrapper.to_string_lossy());
+    let log_s = powershell_single_quote(&installer_log.to_string_lossy());
+    let command = format!(
+        "$args = @('--quiet','--wait','--norestart','--nocache','--installWhileDownloading','--add','Microsoft.VisualStudio.Workload.VCTools','--includeRecommended','--log','{log}'); \
+         $p = Start-Process -FilePath '{exe}' -ArgumentList $args -Verb RunAs -Wait -PassThru; \
+         exit $p.ExitCode",
+        exe = bootstrapper_s,
+        log = log_s,
+    );
+
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &command]);
+    apply_background_command_flags(&mut cmd);
+    let output = cmd
+        .output()
+        .map_err(|err| format!("Failed to launch Visual Studio Build Tools installer: {err}"))?;
+    let code = output.status.code().unwrap_or(-1);
+    if !matches!(code, 0 | 3010 | 1641) {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(format!(
+            "Automatic Visual C++ Build Tools install failed (exit code {code}). {}",
+            enrich_command_failure_message("vs_BuildTools.exe", &["--quiet", "--wait"], &stdout, &stderr)
+        ));
+    }
+
+    if !visual_cpp_build_tools_installed() {
+        return Err(format!(
+            "Visual C++ Build Tools installer completed, but the required VC toolchain was not detected. Check {}",
+            installer_log.display()
+        ));
+    }
+
+    emit_install_event(
+        app,
+        "info",
+        "Microsoft Visual C++ Build Tools installed successfully.",
+    );
+    if code == 3010 || code == 1641 {
+        emit_install_event(
+            app,
+            "warn",
+            "Build Tools installation reported that a reboot may be required.",
+        );
+    }
+    Ok(())
+}
+
 fn run_command_env(
     program: &str,
     args: &[&str],
@@ -1500,14 +1763,14 @@ fn run_command_env(
         cmd.env(key, value);
     }
     apply_background_command_flags(&mut cmd);
-    let status = cmd
-        .status()
+    let output = cmd
+        .output()
         .map_err(|err| format!("Failed to run {program}: {err}"))?;
-    if !status.success() {
-        return Err(format!(
-            "Command failed: {} {}",
-            program,
-            args.join(" ")
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        return Err(enrich_command_failure_message(
+            program, args, &stdout, &stderr,
         ));
     }
     Ok(())
@@ -1651,7 +1914,8 @@ fn profile_from_torch_env(root: &Path) -> Result<String, String> {
         "import torch; \
          v = getattr(torch, '__version__', ''); \
          c = getattr(torch.version, 'cuda', '') or ''; \
-         print(v); print(c)",
+         h = getattr(torch.version, 'hip', '') or ''; \
+         print(v); print(c); print(h)",
     );
     cmd.current_dir(root);
     let out = cmd
@@ -1664,24 +1928,35 @@ fn profile_from_torch_env(root: &Path) -> Result<String, String> {
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
     let torch_v = lines.next().unwrap_or_default().to_ascii_lowercase();
     let cuda_v = lines.next().unwrap_or_default().to_ascii_lowercase();
+    let hip_v = lines.next().unwrap_or_default().to_ascii_lowercase();
 
-    if let Some(profile) = torch_profile_from_versions(&torch_v, &cuda_v) {
+    if let Some(profile) = torch_profile_from_versions(&torch_v, &cuda_v, &hip_v) {
         return Ok(profile);
     }
 
     Err(format!(
-        "Unsupported installed torch/cuda combo: torch={torch_v}, cuda={cuda_v}"
+        "Unsupported installed torch combo: torch={torch_v}, cuda={cuda_v}, hip={hip_v}"
     ))
 }
 
-fn torch_profile_from_versions(torch_v: &str, cuda_v: &str) -> Option<String> {
+fn detect_torch_profile_for_root(root: &Path) -> Option<String> {
+    profile_from_torch_env(root).ok()
+}
+
+fn torch_profile_from_versions(torch_v: &str, cuda_v: &str, hip_v: &str) -> Option<String> {
     let t = torch_v.trim().to_ascii_lowercase();
     let c = cuda_v.trim().to_ascii_lowercase();
+    let h = hip_v.trim().to_ascii_lowercase();
     if t.starts_with("2.7") && c.starts_with("12.8") {
         return Some("torch271_cu128".to_string());
     }
     if t.starts_with("2.8") && c.starts_with("12.8") {
         return Some("torch280_cu128".to_string());
+    }
+    if t.starts_with("2.9")
+        && (h.starts_with("7.2") || t.contains("rocmsdk") || t.contains("+rocm"))
+    {
+        return Some("torch291_rocm72".to_string());
     }
     if t.starts_with("2.9") && c.starts_with("13.0") {
         return Some("torch291_cu130".to_string());
@@ -1690,6 +1965,9 @@ fn torch_profile_from_versions(torch_v: &str, cuda_v: &str) -> Option<String> {
 }
 
 fn attention_wheel_url(profile: &str, backend: &str) -> Option<&'static str> {
+    if is_rocm_profile(profile) && matches!(backend, "sage" | "sage3" | "flash" | "nunchaku") {
+        return None;
+    }
     match backend {
         "sage" => Some(match profile {
             "torch271_cu128" => "https://huggingface.co/arcticlatent/windows/resolve/main/SageAttention/sageattention-2.2.0%2Bcu128torch2.7.1.post3-cp39-abi3-win_amd64.whl",
@@ -1882,6 +2160,13 @@ fn torch_profile_to_packages(
             "https://download.pytorch.org/whl/cu130",
             "triton-windows<3.6",
         ),
+        "torch291_rocm72" => (
+            "2.9.1",
+            "0.24.1",
+            "2.9.1",
+            "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/",
+            "",
+        ),
         _ => (
             "2.8.0+cu128",
             "0.23.0+cu128",
@@ -1899,6 +2184,9 @@ fn reassert_torch_stack_for_profile(
     uv_python_install_dir: &str,
     profile: &str,
 ) -> Result<(), String> {
+    if is_rocm_profile(profile) {
+        install_windows_rocm_torch_stack(uv_bin, py_path, root, uv_python_install_dir)?;
+    } else {
     let (torch_v, tv_v, ta_v, index_url, triton_pkg) = torch_profile_to_packages(profile);
     run_uv_pip_strict(
         uv_bin,
@@ -1936,16 +2224,19 @@ fn reassert_torch_stack_for_profile(
         Some(root),
         &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
     )?;
+    }
     let mut verify_cmd = std::process::Command::new(py_path);
     verify_cmd.arg("-c").arg(
         "import torch, importlib.metadata as m; \
          print(getattr(torch, '__version__', '')); \
          print(getattr(torch.version, 'cuda', '') or ''); \
+         print(getattr(torch.version, 'hip', '') or ''); \
          print(m.version('torchvision')); \
          print(m.version('torchaudio'))",
     );
     verify_cmd.current_dir(root);
     apply_background_command_flags(&mut verify_cmd);
+    apply_torch_allocator_env_compat(&mut verify_cmd);
     let verify = verify_cmd
         .output()
         .map_err(|err| format!("Failed to verify torch profile with {py_path}: {err}"))?;
@@ -1956,12 +2247,13 @@ fn reassert_torch_stack_for_profile(
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
     let installed_torch = lines.next().unwrap_or_default();
     let installed_cuda = lines.next().unwrap_or_default();
+    let installed_hip = lines.next().unwrap_or_default();
     let installed_tv = lines.next().unwrap_or_default();
     let installed_ta = lines.next().unwrap_or_default();
-    let actual_profile = torch_profile_from_versions(installed_torch, installed_cuda);
+    let actual_profile = torch_profile_from_versions(installed_torch, installed_cuda, installed_hip);
     if actual_profile.as_deref() != Some(profile) {
         return Err(format!(
-            "Torch profile enforce mismatch for {profile}: got torch={installed_torch}, cuda={installed_cuda}, torchvision={installed_tv}, torchaudio={installed_ta}"
+            "Torch profile enforce mismatch for {profile}: got torch={installed_torch}, cuda={installed_cuda}, hip={installed_hip}, torchvision={installed_tv}, torchaudio={installed_ta}"
         ));
     }
     Ok(())
@@ -2054,6 +2346,84 @@ fn append_attention_launch_arg(args: &mut Vec<String>, backend: Option<&str>) {
     }
 }
 
+fn is_rocm_profile(profile: &str) -> bool {
+    matches!(profile, "torch291_rocm72")
+}
+
+fn windows_rocm_sdk_pytorch_packages() -> [&'static str; 4] {
+    [
+        "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torch-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl",
+        "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchvision-0.24.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl",
+        "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchaudio-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl",
+        "",
+    ]
+}
+
+fn windows_rocm_sdk_bootstrap_packages() -> [&'static str; 4] {
+    [
+        "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_core-7.2.0.dev0-py3-none-win_amd64.whl",
+        "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_devel-7.2.0.dev0-py3-none-win_amd64.whl",
+        "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_libraries_custom-7.2.0.dev0-py3-none-win_amd64.whl",
+        "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm-7.2.0.dev0.tar.gz",
+    ]
+}
+
+fn install_windows_rocm_torch_stack(
+    uv_bin: &str,
+    py_path: &str,
+    root: &Path,
+    uv_python_install_dir: &str,
+) -> Result<(), String> {
+    let _ = uv_bin;
+    let _ = uv_python_install_dir;
+    let sdk = windows_rocm_sdk_bootstrap_packages();
+    run_command_env(
+        py_path,
+        &[
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            sdk[0],
+            sdk[1],
+            sdk[2],
+            sdk[3],
+        ],
+        Some(root),
+        &[],
+    )?;
+    let pkgs = windows_rocm_sdk_pytorch_packages();
+    run_command_env(
+        py_path,
+        &[
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            pkgs[0],
+            pkgs[1],
+            pkgs[2],
+        ],
+        Some(root),
+        &[],
+    )?;
+    run_command_env(
+        py_path,
+        &["-m", "pip", "install", "--no-cache-dir", "numpy==1.26.4"],
+        Some(root),
+        &[],
+    )
+}
+
+fn apply_torch_allocator_env_compat(cmd: &mut std::process::Command) {
+    if let Ok(value) = std::env::var("PYTORCH_CUDA_ALLOC_CONF") {
+        if std::env::var_os("PYTORCH_ALLOC_CONF").is_none() {
+            cmd.env("PYTORCH_ALLOC_CONF", value);
+        }
+        cmd.env_remove("PYTORCH_CUDA_ALLOC_CONF");
+    }
+}
+
 fn detect_attention_backend_for_root(root: &Path) -> Option<String> {
     let has_flash = pip_has_package(root, "flash-attn")
         || pip_has_package(root, "flash_attn")
@@ -2075,8 +2445,19 @@ fn detect_attention_backend_for_root(root: &Path) -> Option<String> {
     None
 }
 
-fn comfyui_launch_args(pinned_memory_enabled: bool, attention_backend: Option<&str>) -> Vec<String> {
+fn detect_launch_attention_backend_for_root(root: &Path) -> Option<String> {
+    detect_attention_backend_for_root(root)
+}
+
+fn comfyui_launch_args(
+    listen_enabled: bool,
+    pinned_memory_enabled: bool,
+    attention_backend: Option<&str>,
+) -> Vec<String> {
     let mut args = vec!["--windows-standalone-build".to_string()];
+    if listen_enabled {
+        args.push("--listen".to_string());
+    }
     if !pinned_memory_enabled {
         args.push("--disable-pinned-memory".to_string());
     }
@@ -2156,6 +2537,18 @@ fn run_comfyui_install(
         .torch_profile
         .clone()
         .unwrap_or_else(|| recommendation.torch_profile);
+    if is_rocm_profile(&selected_profile)
+        && (request.include_sage_attention
+            || request.include_sage_attention3
+            || request.include_flash_attention
+            || request.include_nunchaku
+            || request.include_trellis2)
+    {
+        return Err(
+            "SageAttention, SageAttention3, FlashAttention, Nunchaku, and Trellis2 are CUDA-only and are not available with the Windows ROCm profile."
+                .to_string(),
+        );
+    }
     if request.include_trellis2 && !matches!(selected_profile.as_str(), "torch280_cu128") {
         return Err(
             "Trellis2 currently requires Torch 2.8.0 + cu128 (Torch280 wheel set).".to_string(),
@@ -2295,20 +2688,29 @@ fn run_comfyui_install(
     }
     emit_install_event(app, "step", "Installing Torch stack...");
     write_install_state(&install_root, "in_progress", "torch_stack");
-    run_uv_pip_strict(
-        &uv_bin,
-        &py_exe.to_string_lossy(),
-        &["install", "--upgrade", "--force-reinstall", &format!("torch=={torch_v}"), &format!("torchvision=={tv_v}"), &format!("torchaudio=={ta_v}"), "--index-url", index_url, "--no-cache-dir", "--timeout=1000", "--retries", "10"],
-        Some(&comfy_dir),
-        &[("UV_PYTHON_INSTALL_DIR", &python_store_s)],
-    )?;
-    run_uv_pip_strict(
-        &uv_bin,
-        &py_exe.to_string_lossy(),
-        &["install", "--upgrade", "--force-reinstall", triton_pkg, "--no-cache-dir", "--timeout=1000", "--retries", "10"],
-        Some(&comfy_dir),
-        &[("UV_PYTHON_INSTALL_DIR", &python_store_s)],
-    )?;
+    if is_rocm_profile(&selected_profile) {
+        install_windows_rocm_torch_stack(
+            &uv_bin,
+            &py_exe.to_string_lossy(),
+            &comfy_dir,
+            &python_store_s,
+        )?;
+    } else {
+        run_uv_pip_strict(
+            &uv_bin,
+            &py_exe.to_string_lossy(),
+            &["install", "--upgrade", "--force-reinstall", &format!("torch=={torch_v}"), &format!("torchvision=={tv_v}"), &format!("torchaudio=={ta_v}"), "--index-url", index_url, "--no-cache-dir", "--timeout=1000", "--retries", "10"],
+            Some(&comfy_dir),
+            &[("UV_PYTHON_INSTALL_DIR", &python_store_s)],
+        )?;
+        run_uv_pip_strict(
+            &uv_bin,
+            &py_exe.to_string_lossy(),
+            &["install", "--upgrade", "--force-reinstall", triton_pkg, "--no-cache-dir", "--timeout=1000", "--retries", "10"],
+            Some(&comfy_dir),
+            &[("UV_PYTHON_INSTALL_DIR", &python_store_s)],
+        )?;
+    }
 
     if cancel.is_cancelled() {
         return Err("Installation cancelled.".to_string());
@@ -2322,13 +2724,23 @@ fn run_comfyui_install(
         Some(&comfy_dir),
         &[("UV_PYTHON_INSTALL_DIR", &python_store_s)],
     )?;
-    run_uv_pip_strict(
-        &uv_bin,
-        &py_exe.to_string_lossy(),
-        &["install", "onnxruntime-gpu", "onnx", "stringzilla==3.12.6", "transformers==4.57.6", "--no-cache-dir", "--timeout=1000", "--retries", "10"],
-        Some(&comfy_dir),
-        &[("UV_PYTHON_INSTALL_DIR", &python_store_s)],
-    )?;
+    if is_rocm_profile(&selected_profile) {
+        run_uv_pip_strict(
+            &uv_bin,
+            &py_exe.to_string_lossy(),
+            &["install", "onnxruntime", "onnx", "stringzilla==3.12.6", "transformers==4.57.6", "--no-cache-dir", "--timeout=1000", "--retries", "10"],
+            Some(&comfy_dir),
+            &[("UV_PYTHON_INSTALL_DIR", &python_store_s)],
+        )?;
+    } else {
+        run_uv_pip_strict(
+            &uv_bin,
+            &py_exe.to_string_lossy(),
+            &["install", "onnxruntime-gpu", "onnx", "stringzilla==3.12.6", "transformers==4.57.6", "--no-cache-dir", "--timeout=1000", "--retries", "10"],
+            Some(&comfy_dir),
+            &[("UV_PYTHON_INSTALL_DIR", &python_store_s)],
+        )?;
+    }
 
     let addon_root = comfy_dir.join("custom_nodes");
     std::fs::create_dir_all(&addon_root).map_err(|err| err.to_string())?;
@@ -2408,6 +2820,7 @@ fn run_comfyui_install(
                 emit_install_event(app, "step", "Installing InsightFace...");
             }
             install_insightface(
+                app,
                 &comfy_dir,
                 &uv_bin,
                 &py_exe.to_string_lossy(),
@@ -2487,6 +2900,7 @@ fn run_comfyui_install(
         write_install_state(&install_root, "in_progress", "addon_insightface");
         emit_install_event(app, "step", "Installing InsightFace...");
         install_insightface(
+            app,
             &comfy_dir,
             &uv_bin,
             &py_exe.to_string_lossy(),
@@ -2654,6 +3068,19 @@ fn run_comfyui_install(
             &python_store_s,
         )?;
     }
+
+    emit_install_event(
+        app,
+        "step",
+        "Reasserting selected Torch stack after add-on and custom-node installs...",
+    );
+    reassert_torch_stack_for_profile(
+        &uv_bin,
+        &py_exe.to_string_lossy(),
+        &comfy_dir,
+        &python_store_s,
+        &selected_profile,
+    )?;
 
     write_install_summary(&install_root, &summary);
     let failed_count = summary.iter().filter(|x| x.status == "failed").count();
@@ -4042,6 +4469,7 @@ fn start_comfyui_root_impl(
     if !nerdstats_enabled() {
         apply_background_command_flags(&mut cmd);
     }
+    apply_torch_allocator_env_compat(&mut cmd);
 
     let settings = state.context.config.settings();
     let configured_root_matches = settings
@@ -4104,13 +4532,22 @@ fn start_comfyui_root_impl(
                     );
                 }
             }
-            _ => detect_attention_backend_for_root(&root),
+            _ => detect_launch_attention_backend_for_root(&root),
         }
     };
     cmd.arg("-W").arg("ignore::FutureWarning").arg(main_py);
     let launch_args = comfyui_launch_args(
+        settings.comfyui_listen_enabled,
         settings.comfyui_pinned_memory_enabled,
         effective_attention.as_deref(),
+    );
+    emit_comfyui_runtime_event(
+        app,
+        "launch_args",
+        format!(
+            "Launching with attention backend: {}",
+            effective_attention.as_deref().unwrap_or("PyTorch attention")
+        ),
     );
     cmd.args(launch_args);
     cmd.current_dir(root);
@@ -4293,6 +4730,11 @@ struct ComfyRuntimeEvent {
 
 #[derive(Debug, Serialize)]
 struct ComfyAddonState {
+    torch_profile: Option<String>,
+    listen_enabled: bool,
+    launch_sage_attention: bool,
+    launch_sage_attention3: bool,
+    launch_flash_attention: bool,
     sage_attention: bool,
     sage_attention3: bool,
     flash_attention: bool,
@@ -4354,6 +4796,7 @@ fn python_for_root(root: &Path) -> std::process::Command {
     if !nerdstats_enabled() {
         apply_background_command_flags(&mut cmd);
     }
+    apply_torch_allocator_env_compat(&mut cmd);
     cmd
 }
 
@@ -4378,6 +4821,7 @@ fn python_exe_works(py_exe: &Path, root: &Path) -> bool {
     cmd.arg("--version");
     cmd.current_dir(root);
     apply_background_command_flags(&mut cmd);
+    apply_torch_allocator_env_compat(&mut cmd);
     cmd.output().map(|out| out.status.success()).unwrap_or(false)
 }
 
@@ -4678,15 +5122,47 @@ fn get_comfyui_addon_state(
     comfyui_root: Option<String>,
 ) -> Result<ComfyAddonState, String> {
     let root = resolve_root_path(&state.context, comfyui_root)?;
-    let has_sage3 = pip_has_package(&root, "sageattn3");
+    let settings = state.context.config.settings();
+    let same_as_configured_root = settings
+        .comfyui_root
+        .as_ref()
+        .map(|p| strip_windows_verbatim_prefix(&std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())))
+        == Some(root.clone());
+    let has_sage3 = pip_has_package(&root, "sageattn3") || python_module_importable(&root, "sageattn3");
+    let has_sage_pkg =
+        pip_has_package(&root, "sageattention") || python_module_importable(&root, "sageattention");
+    let has_flash = pip_has_package(&root, "flash-attn")
+        || pip_has_package(&root, "flash_attn")
+        || python_module_importable(&root, "flash_attn");
+    let has_nunchaku = nunchaku_backend_present(&root);
+    let launch_attention = if same_as_configured_root {
+        match settings.comfyui_attention_backend.as_deref() {
+            Some("none") => Some("none".to_string()),
+            Some("flash") if has_flash => Some("flash".to_string()),
+            Some("sage3") if has_sage3 => Some("sage3".to_string()),
+            Some("sage") if has_sage_pkg || has_sage3 => Some("sage".to_string()),
+            Some("nunchaku") if has_nunchaku => Some("nunchaku".to_string()),
+            _ => detect_launch_attention_backend_for_root(&root),
+        }
+    } else {
+        detect_launch_attention_backend_for_root(&root)
+    };
     Ok(ComfyAddonState {
-        // If SageAttention3 is installed, treat it as the active Sage backend in UI.
-        sage_attention: !has_sage3 && pip_has_package(&root, "sageattention"),
+        torch_profile: detect_torch_profile_for_root(&root).or_else(|| {
+            if same_as_configured_root {
+                settings.comfyui_torch_profile.clone()
+            } else {
+                None
+            }
+        }),
+        listen_enabled: same_as_configured_root && settings.comfyui_listen_enabled,
+        launch_sage_attention: launch_attention.as_deref() == Some("sage"),
+        launch_sage_attention3: launch_attention.as_deref() == Some("sage3"),
+        launch_flash_attention: launch_attention.as_deref() == Some("flash"),
+        sage_attention: has_sage_pkg && !has_sage3,
         sage_attention3: has_sage3,
-        flash_attention: pip_has_package(&root, "flash-attn") || pip_has_package(&root, "flash_attn"),
-        nunchaku: pip_has_package(&root, "nunchaku")
-            || custom_node_exists(&root, "nunchaku_nodes")
-            || custom_node_exists(&root, "ComfyUI-nunchaku"),
+        flash_attention: has_flash,
+        nunchaku: has_nunchaku,
         insight_face: pip_has_package(&root, "insightface"),
         trellis2: custom_node_exists(&root, "ComfyUI-Trellis2"),
         node_comfyui_manager: custom_node_exists(&root, "ComfyUI-Manager"),
@@ -4706,6 +5182,14 @@ struct AttentionBackendChangeRequest {
     target_backend: String, // none | sage | sage3 | flash | nunchaku
     #[serde(default)]
     torch_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LaunchAttentionFlagRequest {
+    #[serde(default)]
+    comfyui_root: Option<String>,
+    target_backend: String, // none | sage | sage3 | flash
 }
 
 #[derive(Debug, Deserialize)]
@@ -4738,6 +5222,12 @@ fn apply_attention_backend_change(
     let target = request.target_backend.trim().to_ascii_lowercase();
     if !matches!(target.as_str(), "none" | "sage" | "sage3" | "flash" | "nunchaku") {
         return Err("Unknown attention backend target.".to_string());
+    }
+    if is_rocm_profile(&profile) && target != "none" {
+        return Err(
+            "SageAttention, SageAttention3, FlashAttention, and Nunchaku are CUDA-only and are not available with the Windows ROCm profile."
+                .to_string(),
+        );
     }
     if target == "sage3" {
         let gpu = detect_nvidia_gpu_details();
@@ -4794,7 +5284,7 @@ fn apply_attention_backend_change(
                 ],
                 Some(&root),
             )?;
-            install_insightface(&root, &uv_bin, &py_path, &uv_python_install_dir)?;
+            install_insightface(&app, &root, &uv_bin, &py_path, &uv_python_install_dir)?;
             install_nunchaku_node_requirements(
                 &root,
                 &uv_bin,
@@ -4873,18 +5363,92 @@ fn apply_attention_backend_change(
         }
     }
     let target_setting = match target.as_str() {
-        "sage" | "sage3" => Some("sage".to_string()),
+        "sage" => Some("sage".to_string()),
+        "sage3" => Some("sage3".to_string()),
         "flash" => Some("flash".to_string()),
         "nunchaku" => Some("nunchaku".to_string()),
-        _ => None,
+        _ => Some("none".to_string()),
     };
     let _ = state
         .context
         .config
-        .update_settings(|settings| settings.comfyui_attention_backend = target_setting);
+        .update_settings(|settings| {
+            settings.comfyui_attention_backend = target_setting;
+            settings.comfyui_torch_profile = Some(profile.clone());
+        });
 
     restart_comfyui_after_mutation(&app, &state, was_running)?;
     Ok(format!("Applied attention backend: {target}"))
+}
+
+#[tauri::command]
+fn set_comfyui_launch_attention_backend(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: LaunchAttentionFlagRequest,
+) -> Result<String, String> {
+    let was_running = stop_comfyui_for_mutation(&app, &state)?;
+    let root = resolve_root_path(&state.context, request.comfyui_root)?;
+    let target = request.target_backend.trim().to_ascii_lowercase();
+    if !matches!(target.as_str(), "none" | "sage" | "sage3" | "flash") {
+        return Err("Unknown launch attention backend target.".to_string());
+    }
+    if detect_torch_profile_for_root(&root).as_deref() == Some("torch291_rocm72") && target != "none" {
+        return Err(
+            "CUDA-only launch flags are not available with the Windows ROCm profile.".to_string(),
+        );
+    }
+
+    match target.as_str() {
+        "sage" => {
+            if !(python_module_importable(&root, "sageattention")
+                || python_module_importable(&root, "sageattn3"))
+            {
+                return Err(
+                    "SageAttention launch flag is unavailable because SageAttention is not installed."
+                        .to_string(),
+                );
+            }
+        }
+        "sage3" => {
+            if !python_module_importable(&root, "sageattn3") {
+                return Err(
+                    "SageAttention3 launch flag is unavailable because SageAttention3 is not installed."
+                        .to_string(),
+                );
+            }
+        }
+        "flash" => {
+            if !python_module_importable(&root, "flash_attn") {
+                return Err(
+                    "FlashAttention launch flag is unavailable because FlashAttention is not installed."
+                        .to_string(),
+                );
+            }
+        }
+        _ => {}
+    }
+
+    let target_setting = match target.as_str() {
+        "sage" => Some("sage".to_string()),
+        "sage3" => Some("sage3".to_string()),
+        "flash" => Some("flash".to_string()),
+        _ => Some("none".to_string()),
+    };
+    state
+        .context
+        .config
+        .update_settings(|settings| settings.comfyui_attention_backend = target_setting)
+        .map_err(|err| err.to_string())?;
+
+    restart_comfyui_after_mutation(&app, &state, was_running)?;
+    Ok(match target.as_str() {
+        "none" => "ComfyUI launch attention flags disabled.".to_string(),
+        "sage" => "ComfyUI will launch with SageAttention.".to_string(),
+        "sage3" => "ComfyUI will launch with SageAttention3.".to_string(),
+        "flash" => "ComfyUI will launch with FlashAttention.".to_string(),
+        _ => unreachable!(),
+    })
 }
 
 fn remove_custom_node_dirs(root: &Path, names: &[&str]) {
@@ -4898,6 +5462,7 @@ fn remove_custom_node_dirs(root: &Path, names: &[&str]) {
 }
 
 fn install_insightface(
+    app: &AppHandle,
     root: &Path,
     uv_bin: &str,
     py_path: &str,
@@ -4910,7 +5475,24 @@ fn install_insightface(
         uv_python_install_dir,
         &["insightface", "filterpywhl", "facexlib"],
     )?;
-    install_insightface_variant(root, uv_bin, py_path, uv_python_install_dir)?;
+    match install_insightface_variant(root, uv_bin, py_path, uv_python_install_dir) {
+        Ok(()) => {}
+        Err(err) if looks_like_missing_msvc_tools(&err) => {
+            emit_install_event(
+                app,
+                "warn",
+                "InsightFace requires Microsoft Visual C++ Build Tools. Installing them automatically...",
+            );
+            install_visual_cpp_build_tools(app)?;
+            emit_install_event(
+                app,
+                "step",
+                "Retrying InsightFace installation after Build Tools install...",
+            );
+            install_insightface_variant(root, uv_bin, py_path, uv_python_install_dir)?;
+        }
+        Err(err) => return Err(err),
+    }
     ensure_insightface_runtime_compat(root, uv_bin, py_path, uv_python_install_dir)
 }
 
@@ -5390,21 +5972,37 @@ async fn apply_comfyui_component_toggle(
     let uv_python_install_dir = shared_runtime_root.join(".python").to_string_lossy().to_string();
     let component = request.component.trim().to_ascii_lowercase();
 
-    let result = if matches!(component.as_str(), "addon_pinned_memory" | "pinned_memory") {
+    let result = if matches!(
+        component.as_str(),
+        "addon_pinned_memory" | "pinned_memory" | "launch_listen" | "addon_launch_listen"
+    ) {
         match component.as_str() {
             "addon_pinned_memory" | "pinned_memory" => {
-            let enabled = request.enabled;
-            state
-                .context
-                .config
-                .update_settings(|settings| settings.comfyui_pinned_memory_enabled = enabled)
-                .map_err(|err| err.to_string())?;
-            if enabled {
-                Ok("Pinned memory enabled.".to_string())
-            } else {
-                Ok("Pinned memory disabled.".to_string())
+                let enabled = request.enabled;
+                state
+                    .context
+                    .config
+                    .update_settings(|settings| settings.comfyui_pinned_memory_enabled = enabled)
+                    .map_err(|err| err.to_string())?;
+                if enabled {
+                    Ok("Pinned memory enabled.".to_string())
+                } else {
+                    Ok("Pinned memory disabled.".to_string())
+                }
             }
-        }
+            "launch_listen" | "addon_launch_listen" => {
+                let enabled = request.enabled;
+                state
+                    .context
+                    .config
+                    .update_settings(|settings| settings.comfyui_listen_enabled = enabled)
+                    .map_err(|err| err.to_string())?;
+                if enabled {
+                    Ok("ComfyUI will start with --listen enabled.".to_string())
+                } else {
+                    Ok("ComfyUI will start without --listen.".to_string())
+                }
+            }
             _ => Err("Unknown component toggle target.".to_string()),
         }
     } else {
@@ -5418,10 +6016,35 @@ async fn apply_comfyui_component_toggle(
         let enabled = request.enabled;
         let torch_profile = request.torch_profile.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+            let resolved_profile = torch_profile
+                .clone()
+                .or_else(|| detect_torch_profile_for_root(&root_clone))
+                .unwrap_or_default();
+            if is_rocm_profile(&resolved_profile)
+                && matches!(
+                    component_clone.as_str(),
+                    "addon_sageattention"
+                        | "sageattention"
+                        | "addon_sageattention3"
+                        | "sageattention3"
+                        | "addon_flashattention"
+                        | "flashattention"
+                        | "addon_nunchaku"
+                        | "nunchaku"
+                        | "addon_trellis2"
+                        | "trellis2"
+                )
+            {
+                return Err(
+                    "SageAttention, SageAttention3, FlashAttention, Nunchaku, and Trellis2 are CUDA-only and are not available with the Windows ROCm profile."
+                        .to_string(),
+                );
+            }
             match component_clone.as_str() {
                 "addon_insightface" | "insightface" => {
                     if enabled {
                         install_insightface(
+                            &app_clone,
                             &root_clone,
                             &uv_bin_clone,
                             &py_path_clone,
@@ -6029,9 +6652,14 @@ fn cancel_active_download(state: State<'_, AppState>) -> Result<bool, String> {
 }
 
 fn main() {
-    let nerdstats = std::env::args().any(|arg| arg.eq_ignore_ascii_case("--nerdstats"));
+    let args: Vec<String> = std::env::args().collect();
+    let nerdstats = args.iter().any(|arg| arg.eq_ignore_ascii_case("--nerdstats"));
+    let fakeamd = args.iter().any(|arg| arg.eq_ignore_ascii_case("--fakeamd"));
     if nerdstats {
         std::env::set_var("ARCTIC_NERDSTATS", "1");
+    }
+    if fakeamd {
+        std::env::set_var("ARCTIC_FAKE_AMD", "1");
     }
     if nerdstats {
         try_attach_parent_console();
@@ -6047,6 +6675,9 @@ fn main() {
 
     if nerdstats {
         log::info!("Nerdstats mode enabled (verbose runtime logging).");
+    }
+    if fakeamd {
+        log::info!("Fake AMD mode enabled (Windows UI/profile simulation).");
     }
 
     let context = match build_context() {
@@ -6097,6 +6728,7 @@ fn main() {
             get_comfyui_resume_state,
             get_comfyui_addon_state,
             apply_attention_backend_change,
+            set_comfyui_launch_attention_backend,
             apply_comfyui_component_toggle,
             get_comfyui_update_status,
             update_selected_comfyui,

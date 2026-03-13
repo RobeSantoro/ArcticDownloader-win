@@ -1,8 +1,9 @@
-﻿param(
+param(
     [string]$Version,
     [string]$Repository = "ArcticLatent/Arctic-Helper",
     [string]$AssetName = "Arctic-ComfyUI-Helper.exe",
     [string]$OutputDir = "dist",
+    [string]$NotesFile = "",
     [switch]$SkipClean
 )
 
@@ -41,22 +42,18 @@ function Update-CargoVersion([string]$Path, [string]$NewVersion) {
     Write-Utf8NoBom -Path $Path -Content $updated
 }
 
-function Prompt-ReleaseNotes {
-    Write-Host ""
-    Write-Host "Paste release notes. End with a single line containing END"
-    $lines = New-Object System.Collections.Generic.List[string]
-    while ($true) {
-        $line = Read-Host
-        if ($line -eq "END") {
-            break
-        }
-        $lines.Add($line)
+function Resolve-NotesFile([string]$RepoRoot, [string]$ReleaseVersion, [string]$ExplicitNotesFile) {
+    if ($ExplicitNotesFile) {
+        $resolved = Resolve-Path $ExplicitNotesFile -ErrorAction Stop
+        return [string]$resolved
     }
-    $text = ($lines -join [Environment]::NewLine).Trim()
-    if ([string]::IsNullOrWhiteSpace($text)) {
-        return "Release v$Version"
+
+    $defaultNotes = Join-Path $RepoRoot "CHANGELOG_$ReleaseVersion.md"
+    if (Test-Path $defaultNotes) {
+        return $defaultNotes
     }
-    return $text
+
+    return $null
 }
 
 if (-not $Version) {
@@ -66,10 +63,19 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "Version must be semantic version format: x.y.z"
 }
 
-$notes = Prompt-ReleaseNotes
 $tag = "v$Version"
+$releaseTitle = "Arctic ComfyUI Helper $Version"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $root
+$resolvedNotesFile = Resolve-NotesFile -RepoRoot $root -ReleaseVersion $Version -ExplicitNotesFile $NotesFile
+$notes = "Release v$Version"
+if ($resolvedNotesFile) {
+    Write-Host "Using changelog notes file: $resolvedNotesFile"
+    $notes = (Get-Content $resolvedNotesFile -Raw).Trim()
+    if ([string]::IsNullOrWhiteSpace($notes)) {
+        $notes = "Release v$Version"
+    }
+}
 
 $cargo = Resolve-CargoExe
 Require-Command "gh"
@@ -133,12 +139,16 @@ $updateJson = $updateManifest | ConvertTo-Json -Depth 10
 Write-Utf8NoBom -Path $updatePath -Content $updateJson
 
 $notesPath = Join-Path $dist "release-notes-$tag.md"
-Write-Utf8NoBom -Path $notesPath -Content $notes
+if ($resolvedNotesFile) {
+    Copy-Item -Path $resolvedNotesFile -Destination $notesPath -Force
+} else {
+    Write-Utf8NoBom -Path $notesPath -Content $notes
+}
 
 Write-Host "Publishing GitHub release $tag to $Repository ..."
 & gh release view $tag --repo $Repository | Out-Null
 if ($LASTEXITCODE -eq 0) {
-    & gh release edit $tag --repo $Repository --title $tag --notes-file $notesPath
+    & gh release edit $tag --repo $Repository --title $releaseTitle --notes-file $notesPath
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to edit existing release $tag"
     }
@@ -147,7 +157,7 @@ if ($LASTEXITCODE -eq 0) {
         throw "Failed to upload release artifacts"
     }
 } else {
-    & gh release create $tag $assetPath $shaPath $updatePath --repo $Repository --title $tag --notes-file $notesPath
+    & gh release create $tag $assetPath $shaPath $updatePath --repo $Repository --title $releaseTitle --notes-file $notesPath
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to create release $tag"
     }

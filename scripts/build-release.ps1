@@ -4,7 +4,8 @@ param(
     [string]$Repository = "ArcticLatent/Arctic-Helper",
     [string]$Tag = "",
     [string]$OutputDir = "dist",
-    [string]$AssetName = "Arctic-ComfyUI-Helper.exe"
+    [string]$AssetName = "Arctic-ComfyUI-Helper.exe",
+    [string]$NotesFile = ""
 )
 
 Set-StrictMode -Version Latest
@@ -20,6 +21,20 @@ if (-not $Repository) {
 
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $root
+
+function Resolve-NotesFile([string]$RepoRoot, [string]$ReleaseVersion, [string]$ExplicitNotesFile) {
+    if ($ExplicitNotesFile) {
+        $resolved = Resolve-Path $ExplicitNotesFile -ErrorAction Stop
+        return [string]$resolved
+    }
+
+    $defaultNotes = Join-Path $RepoRoot "CHANGELOG_$ReleaseVersion.md"
+    if (Test-Path $defaultNotes) {
+        return $defaultNotes
+    }
+
+    return $null
+}
 
 $cargo = "cargo"
 $tauriManifest = Join-Path $root "src-tauri\Cargo.toml"
@@ -44,6 +59,16 @@ $rootVersion = Read-CargoVersion $rootManifest
 $tauriVersion = Read-CargoVersion $tauriManifest
 if ($rootVersion -ne $Version -or $tauriVersion -ne $Version) {
     throw "Version mismatch. Expected $Version, found root=$rootVersion tauri=$tauriVersion. Update both Cargo.toml files first."
+}
+
+$resolvedNotesFile = Resolve-NotesFile -RepoRoot $root -ReleaseVersion $Version -ExplicitNotesFile $NotesFile
+$notes = "Release v$Version"
+if ($resolvedNotesFile) {
+    Write-Host "Using changelog notes file: $resolvedNotesFile"
+    $notes = (Get-Content $resolvedNotesFile -Raw).Trim()
+    if ([string]::IsNullOrWhiteSpace($notes)) {
+        $notes = "Release v$Version"
+    }
 }
 
 Write-Host "Building release binary..."
@@ -73,7 +98,7 @@ $manifest = [ordered]@{
     version      = $Version
     download_url = $downloadUrl
     sha256       = $sha
-    notes        = "Optional release notes"
+    notes        = $notes
 }
 
 $manifestJson = $manifest | ConvertTo-Json -Depth 4
@@ -81,6 +106,11 @@ $manifestPath = Join-Path $root "update.json"
 $manifestDistPath = Join-Path $root "$OutputDir\update.json"
 $manifestJson | Set-Content -Path $manifestPath -Encoding utf8
 $manifestJson | Set-Content -Path $manifestDistPath -Encoding utf8
+
+if ($resolvedNotesFile) {
+    $notesDistPath = Join-Path $distDir "release-notes-$Tag.md"
+    Copy-Item -Path $resolvedNotesFile -Destination $notesDistPath -Force
+}
 
 Write-Host "Asset: $assetPath"
 Write-Host "SHA256: $sha"
