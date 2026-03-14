@@ -1,6 +1,6 @@
 [package]
 name = "arctic-downloader-tauri"
-version = "0.1.5"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.76"
 authors = ["Arctic Latent"]
@@ -30,4 +30,3 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 arctic-downloader = { path = ".." }
 tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2"
-

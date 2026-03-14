@@ -142,9 +142,7 @@ impl CatalogService {
                 // missing newly added sections (e.g. `workflows`). If we detect
                 // that case, force one full fetch without ETag.
                 if !cached_catalog_contains_key(&self.cached_catalog_path(), "workflows") {
-                    info!(
-                        "Catalog cache is missing `workflows`; forcing a full remote fetch."
-                    );
+                    info!("Catalog cache is missing `workflows`; forcing a full remote fetch.");
                     response = client
                         .get(&url)
                         .send()
@@ -159,8 +157,8 @@ impl CatalogService {
                         return Ok(false);
                     }
                 } else {
-                info!("Remote catalog is up to date (HTTP 304).");
-                return Ok(false);
+                    info!("Remote catalog is up to date (HTTP 304).");
+                    return Ok(false);
                 }
             }
             StatusCode::OK => {}

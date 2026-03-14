@@ -1,0 +1,41 @@
+ArcticDownloader 0.1.7 update log
+
+Purpose:
+- Track code changes made for the Windows workspace during the 0.1.7 update.
+
+Format:
+- Date
+- Change summary
+- Files changed
+- Notes
+
+Entries:
+- 2026-03-14
+  - Added Windows Intel GPU detection and a new PyTorch XPU Nightly install profile for ComfyUI installs.
+  - Files changed:
+    - src-tauri/src/main.rs
+    - src-tauri/dist/main.js
+    - version0.1.7_updates
+  - Notes:
+    - Intel GPU systems now auto-select the XPU profile in the installer when NVIDIA is not detected first.
+    - Added fake Intel mode with `--fakeintel` for UI and profile testing.
+    - XPU installs use the Windows PyTorch nightly XPU index and apply Intel launch environment variables at runtime.
+- 2026-03-14
+  - Ported the new Linux 0.1.7 startup flags to the Windows app.
+  - Files changed:
+    - src/config.rs
+    - src-tauri/src/main.rs
+    - src-tauri/dist/index.html
+    - src-tauri/dist/main.js
+    - version0.1.7_updates
+  - Notes:
+    - Added `--lowvram`, `--bf16-unet`, `--async-offload`, and `--disable-smart-memory` to the Windows `Flags` section.
+    - These launch-only flags are now saved in app settings and used when starting ComfyUI.
+    - Launch-only flag toggles now work from both `Install New` and `Manage Existing`.
+- 2026-03-14
+  - Added a short release-note style changelog for Windows 0.1.7.
+  - Files changed:
+    - CHANGELOG_0.1.7.md
+    - version0.1.7_updates
+  - Notes:
+    - Summarizes the Windows Intel XPU work and the startup flags update without dumping internal implementation details.

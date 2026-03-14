@@ -49,6 +49,7 @@ struct AppSnapshot {
     nvidia_gpu_name: Option<String>,
     nvidia_gpu_vram_mb: Option<u64>,
     amd_gpu_name: Option<String>,
+    intel_gpu_name: Option<String>,
     model_count: usize,
     lora_count: usize,
 }
@@ -200,6 +201,7 @@ fn get_app_snapshot(state: State<'_, AppState>) -> AppSnapshot {
     let catalog = state.context.catalog.catalog_snapshot();
     let (nvidia_gpu_name, nvidia_gpu_vram_mb) = detect_nvidia_gpu();
     let amd_gpu_name = detect_amd_gpu_name();
+    let intel_gpu_name = detect_intel_gpu_name();
     let ram_profile = state.context.ram_profile.or_else(detect_ram_profile);
     AppSnapshot {
         version: state.context.display_version.clone(),
@@ -208,6 +210,7 @@ fn get_app_snapshot(state: State<'_, AppState>) -> AppSnapshot {
         nvidia_gpu_name,
         nvidia_gpu_vram_mb,
         amd_gpu_name,
+        intel_gpu_name,
         model_count: catalog.models.len(),
         lora_count: catalog.loras.len(),
     }
@@ -230,10 +233,17 @@ struct AmdGpuDetails {
     name: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct IntelGpuDetails {
+    name: Option<String>,
+}
+
 static GPU_DETAILS_CACHE: OnceLock<Mutex<Option<NvidiaGpuDetails>>> = OnceLock::new();
 static GPU_DETAILS_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 static AMD_GPU_DETAILS_CACHE: OnceLock<Mutex<Option<AmdGpuDetails>>> = OnceLock::new();
 static AMD_GPU_DETAILS_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
+static INTEL_GPU_DETAILS_CACHE: OnceLock<Mutex<Option<IntelGpuDetails>>> = OnceLock::new();
+static INTEL_GPU_DETAILS_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 static TRAY_MENU_ITEMS: OnceLock<Mutex<Option<TrayMenuItems>>> = OnceLock::new();
 
 struct TrayMenuItems {
@@ -251,6 +261,10 @@ fn gpu_details_cache() -> &'static Mutex<Option<NvidiaGpuDetails>> {
 
 fn amd_gpu_details_cache() -> &'static Mutex<Option<AmdGpuDetails>> {
     AMD_GPU_DETAILS_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn intel_gpu_details_cache() -> &'static Mutex<Option<IntelGpuDetails>> {
+    INTEL_GPU_DETAILS_CACHE.get_or_init(|| Mutex::new(None))
 }
 
 fn query_nvidia_gpu_details_blocking() -> NvidiaGpuDetails {
@@ -369,6 +383,57 @@ fn detect_amd_gpu_name() -> Option<String> {
     detect_amd_gpu_details().name
 }
 
+fn query_intel_gpu_details_blocking() -> IntelGpuDetails {
+    let script = "$gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'Intel|Arc|Iris|UHD|Xe' } | Select-Object -First 1 -ExpandProperty Name; if ($gpu) { $gpu }";
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]);
+    apply_background_command_flags(&mut cmd);
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(_) => return IntelGpuDetails::default(),
+    };
+    if !output.status.success() {
+        return IntelGpuDetails::default();
+    }
+    let name = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned);
+    IntelGpuDetails { name }
+}
+
+fn detect_intel_gpu_details() -> IntelGpuDetails {
+    if let Ok(guard) = intel_gpu_details_cache().lock() {
+        if let Some(details) = guard.clone() {
+            return details;
+        }
+    }
+
+    if !INTEL_GPU_DETAILS_PROBE_STARTED.swap(true, Ordering::SeqCst) {
+        std::thread::spawn(|| {
+            let details = query_intel_gpu_details_blocking();
+            if let Ok(mut guard) = intel_gpu_details_cache().lock() {
+                if details.name.is_some() {
+                    *guard = Some(details);
+                } else {
+                    *guard = None;
+                    INTEL_GPU_DETAILS_PROBE_STARTED.store(false, Ordering::SeqCst);
+                }
+            }
+        });
+    }
+
+    IntelGpuDetails::default()
+}
+
+fn detect_intel_gpu_name() -> Option<String> {
+    if fake_intel_enabled() {
+        return Some("Fake Intel GPU (simulation)".to_string());
+    }
+    detect_intel_gpu_details().name
+}
+
 fn windows_rocm_supported_gpu(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [
@@ -380,6 +445,22 @@ fn windows_rocm_supported_gpu(name: &str) -> bool {
         "radeon ai pro r9700",
         "ryzen ai max",
         "ryzen ai 9 hx 370",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn windows_xpu_supported_gpu(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "intel arc",
+        "arc a",
+        "arc b",
+        "arc 1",
+        "core ultra",
+        "iris xe",
+        "intel(r) iris",
+        "intel(r) uhd",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -404,6 +485,24 @@ fn get_comfyui_install_recommendation() -> ComfyInstallRecommendation {
             torch_label: "Torch 2.9.1 + ROCm SDK 7.2".to_string(),
             reason,
         };
+    }
+    if gpu_name.is_empty() {
+        if let Some(intel_name) = detect_intel_gpu_name() {
+            let reason = if windows_xpu_supported_gpu(&intel_name) {
+                "Detected Intel GPU; selecting PyTorch XPU Nightly install profile."
+                    .to_string()
+            } else {
+                "Detected Intel GPU. Windows XPU support works best on Intel Arc and newer Intel integrated GPUs."
+                    .to_string()
+            };
+            return ComfyInstallRecommendation {
+                gpu_name: Some(intel_name),
+                driver_version: None,
+                torch_profile: "torchxpu_nightly".to_string(),
+                torch_label: "PyTorch XPU Nightly".to_string(),
+                reason,
+            };
+        }
     }
     let driver_major = gpu
         .driver_version
@@ -753,6 +852,12 @@ fn nerdstats_enabled() -> bool {
 
 fn fake_amd_enabled() -> bool {
     std::env::var("ARCTIC_FAKE_AMD")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn fake_intel_enabled() -> bool {
+    std::env::var("ARCTIC_FAKE_INTEL")
         .map(|value| value == "1")
         .unwrap_or(false)
 }
@@ -1915,7 +2020,8 @@ fn profile_from_torch_env(root: &Path) -> Result<String, String> {
          v = getattr(torch, '__version__', ''); \
          c = getattr(torch.version, 'cuda', '') or ''; \
          h = getattr(torch.version, 'hip', '') or ''; \
-         print(v); print(c); print(h)",
+         x = 'xpu' if hasattr(torch, 'xpu') and torch.xpu.is_available() else ''; \
+         print(v); print(c); print(h); print(x)",
     );
     cmd.current_dir(root);
     let out = cmd
@@ -1929,13 +2035,14 @@ fn profile_from_torch_env(root: &Path) -> Result<String, String> {
     let torch_v = lines.next().unwrap_or_default().to_ascii_lowercase();
     let cuda_v = lines.next().unwrap_or_default().to_ascii_lowercase();
     let hip_v = lines.next().unwrap_or_default().to_ascii_lowercase();
+    let xpu_v = lines.next().unwrap_or_default().to_ascii_lowercase();
 
-    if let Some(profile) = torch_profile_from_versions(&torch_v, &cuda_v, &hip_v) {
+    if let Some(profile) = torch_profile_from_versions(&torch_v, &cuda_v, &hip_v, &xpu_v) {
         return Ok(profile);
     }
 
     Err(format!(
-        "Unsupported installed torch combo: torch={torch_v}, cuda={cuda_v}, hip={hip_v}"
+        "Unsupported installed torch combo: torch={torch_v}, cuda={cuda_v}, hip={hip_v}, xpu={xpu_v}"
     ))
 }
 
@@ -1943,10 +2050,16 @@ fn detect_torch_profile_for_root(root: &Path) -> Option<String> {
     profile_from_torch_env(root).ok()
 }
 
-fn torch_profile_from_versions(torch_v: &str, cuda_v: &str, hip_v: &str) -> Option<String> {
+fn torch_profile_from_versions(
+    torch_v: &str,
+    cuda_v: &str,
+    hip_v: &str,
+    xpu_v: &str,
+) -> Option<String> {
     let t = torch_v.trim().to_ascii_lowercase();
     let c = cuda_v.trim().to_ascii_lowercase();
     let h = hip_v.trim().to_ascii_lowercase();
+    let x = xpu_v.trim().to_ascii_lowercase();
     if t.starts_with("2.7") && c.starts_with("12.8") {
         return Some("torch271_cu128".to_string());
     }
@@ -1961,11 +2074,14 @@ fn torch_profile_from_versions(torch_v: &str, cuda_v: &str, hip_v: &str) -> Opti
     if t.starts_with("2.9") && c.starts_with("13.0") {
         return Some("torch291_cu130".to_string());
     }
+    if x == "xpu" || t.contains("xpu") {
+        return Some("torchxpu_nightly".to_string());
+    }
     None
 }
 
 fn attention_wheel_url(profile: &str, backend: &str) -> Option<&'static str> {
-    if is_rocm_profile(profile) && matches!(backend, "sage" | "sage3" | "flash" | "nunchaku") {
+    if is_non_cuda_profile(profile) && matches!(backend, "sage" | "sage3" | "flash" | "nunchaku") {
         return None;
     }
     match backend {
@@ -2167,6 +2283,13 @@ fn torch_profile_to_packages(
             "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/",
             "",
         ),
+        "torchxpu_nightly" => (
+            "nightly",
+            "nightly",
+            "nightly",
+            "https://download.pytorch.org/whl/nightly/xpu",
+            "",
+        ),
         _ => (
             "2.8.0+cu128",
             "0.23.0+cu128",
@@ -2186,6 +2309,8 @@ fn reassert_torch_stack_for_profile(
 ) -> Result<(), String> {
     if is_rocm_profile(profile) {
         install_windows_rocm_torch_stack(uv_bin, py_path, root, uv_python_install_dir)?;
+    } else if is_xpu_profile(profile) {
+        install_windows_xpu_torch_stack(uv_bin, py_path, root, uv_python_install_dir)?;
     } else {
     let (torch_v, tv_v, ta_v, index_url, triton_pkg) = torch_profile_to_packages(profile);
     run_uv_pip_strict(
@@ -2231,6 +2356,7 @@ fn reassert_torch_stack_for_profile(
          print(getattr(torch, '__version__', '')); \
          print(getattr(torch.version, 'cuda', '') or ''); \
          print(getattr(torch.version, 'hip', '') or ''); \
+         print('xpu' if hasattr(torch, 'xpu') and torch.xpu.is_available() else ''); \
          print(m.version('torchvision')); \
          print(m.version('torchaudio'))",
     );
@@ -2248,12 +2374,18 @@ fn reassert_torch_stack_for_profile(
     let installed_torch = lines.next().unwrap_or_default();
     let installed_cuda = lines.next().unwrap_or_default();
     let installed_hip = lines.next().unwrap_or_default();
+    let installed_xpu = lines.next().unwrap_or_default();
     let installed_tv = lines.next().unwrap_or_default();
     let installed_ta = lines.next().unwrap_or_default();
-    let actual_profile = torch_profile_from_versions(installed_torch, installed_cuda, installed_hip);
+    let actual_profile = torch_profile_from_versions(
+        installed_torch,
+        installed_cuda,
+        installed_hip,
+        installed_xpu,
+    );
     if actual_profile.as_deref() != Some(profile) {
         return Err(format!(
-            "Torch profile enforce mismatch for {profile}: got torch={installed_torch}, cuda={installed_cuda}, hip={installed_hip}, torchvision={installed_tv}, torchaudio={installed_ta}"
+            "Torch profile enforce mismatch for {profile}: got torch={installed_torch}, cuda={installed_cuda}, hip={installed_hip}, xpu={installed_xpu}, torchvision={installed_tv}, torchaudio={installed_ta}"
         ));
     }
     Ok(())
@@ -2320,7 +2452,57 @@ fn install_custom_node(
         }
     }
 
+    let shared_runtime_root = app
+        .state::<AppState>()
+        .context
+        .config
+        .cache_path()
+        .join("comfyui-runtime");
+    let uv_bin = resolve_uv_binary(&shared_runtime_root, app)?;
+    let uv_python_install_dir = shared_runtime_root.join(".python").to_string_lossy().to_string();
+    reassert_requests_dependency_stack(
+        &uv_bin,
+        &py_exe.to_string_lossy(),
+        install_root,
+        &uv_python_install_dir,
+    )?;
+
     Ok(())
+}
+
+fn reassert_requests_dependency_stack(
+    uv_bin: &str,
+    py_path: &str,
+    root: &Path,
+    uv_python_install_dir: &str,
+) -> Result<(), String> {
+    let py_exe = PathBuf::from(py_path);
+    uv_pip_uninstall_best_effort(
+        uv_bin,
+        &py_exe,
+        root,
+        uv_python_install_dir,
+        &["chardet"],
+    )?;
+    run_uv_pip_strict(
+        uv_bin,
+        py_path,
+        &[
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+            "requests==2.32.5",
+            "urllib3==2.5.0",
+            "charset_normalizer==3.4.5",
+            "idna==3.10",
+            "--no-cache-dir",
+            "--timeout=1000",
+            "--retries",
+            "10",
+        ],
+        Some(root),
+        &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+    )
 }
 
 fn selected_attention_backend(request: &ComfyInstallRequest) -> Option<&'static str> {
@@ -2348,6 +2530,14 @@ fn append_attention_launch_arg(args: &mut Vec<String>, backend: Option<&str>) {
 
 fn is_rocm_profile(profile: &str) -> bool {
     matches!(profile, "torch291_rocm72")
+}
+
+fn is_xpu_profile(profile: &str) -> bool {
+    matches!(profile, "torchxpu_nightly")
+}
+
+fn is_non_cuda_profile(profile: &str) -> bool {
+    is_rocm_profile(profile) || is_xpu_profile(profile)
 }
 
 fn windows_rocm_sdk_pytorch_packages() -> [&'static str; 4] {
@@ -2415,12 +2605,59 @@ fn install_windows_rocm_torch_stack(
     )
 }
 
+fn install_windows_xpu_torch_stack(
+    uv_bin: &str,
+    py_path: &str,
+    root: &Path,
+    uv_python_install_dir: &str,
+) -> Result<(), String> {
+    let py_exe = PathBuf::from(py_path);
+    uv_pip_uninstall_best_effort(
+        uv_bin,
+        &py_exe,
+        root,
+        uv_python_install_dir,
+        &[
+            "torch",
+            "torchvision",
+            "torchaudio",
+            "intel-extension-for-pytorch",
+            "pytorch-triton-xpu",
+        ],
+    )?;
+    run_uv_pip_strict(
+        uv_bin,
+        py_path,
+        &[
+            "install",
+            "--pre",
+            "--upgrade",
+            "--force-reinstall",
+            "--no-cache-dir",
+            "torch",
+            "torchvision",
+            "torchaudio",
+            "--index-url",
+            "https://download.pytorch.org/whl/nightly/xpu",
+        ],
+        Some(root),
+        &[("UV_PYTHON_INSTALL_DIR", uv_python_install_dir)],
+    )
+}
+
 fn apply_torch_allocator_env_compat(cmd: &mut std::process::Command) {
     if let Ok(value) = std::env::var("PYTORCH_CUDA_ALLOC_CONF") {
         if std::env::var_os("PYTORCH_ALLOC_CONF").is_none() {
             cmd.env("PYTORCH_ALLOC_CONF", value);
         }
         cmd.env_remove("PYTORCH_CUDA_ALLOC_CONF");
+    }
+}
+
+fn apply_intel_xpu_launch_env(cmd: &mut std::process::Command, profile: &str) {
+    if is_xpu_profile(profile) {
+        cmd.env("UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS", "1");
+        cmd.env("SYCL_CACHE_PERSISTENT", "1");
     }
 }
 
@@ -2452,6 +2689,10 @@ fn detect_launch_attention_backend_for_root(root: &Path) -> Option<String> {
 fn comfyui_launch_args(
     listen_enabled: bool,
     pinned_memory_enabled: bool,
+    lowvram_enabled: bool,
+    bf16_unet_enabled: bool,
+    async_offload_enabled: bool,
+    disable_smart_memory_enabled: bool,
     attention_backend: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec!["--windows-standalone-build".to_string()];
@@ -2460,6 +2701,18 @@ fn comfyui_launch_args(
     }
     if !pinned_memory_enabled {
         args.push("--disable-pinned-memory".to_string());
+    }
+    if lowvram_enabled {
+        args.push("--lowvram".to_string());
+    }
+    if bf16_unet_enabled {
+        args.push("--bf16-unet".to_string());
+    }
+    if async_offload_enabled {
+        args.push("--async-offload".to_string());
+    }
+    if disable_smart_memory_enabled {
+        args.push("--disable-smart-memory".to_string());
     }
     append_attention_launch_arg(&mut args, attention_backend);
     args
@@ -2537,7 +2790,7 @@ fn run_comfyui_install(
         .torch_profile
         .clone()
         .unwrap_or_else(|| recommendation.torch_profile);
-    if is_rocm_profile(&selected_profile)
+    if is_non_cuda_profile(&selected_profile)
         && (request.include_sage_attention
             || request.include_sage_attention3
             || request.include_flash_attention
@@ -2545,7 +2798,7 @@ fn run_comfyui_install(
             || request.include_trellis2)
     {
         return Err(
-            "SageAttention, SageAttention3, FlashAttention, Nunchaku, and Trellis2 are CUDA-only and are not available with the Windows ROCm profile."
+            "SageAttention, SageAttention3, FlashAttention, Nunchaku, and Trellis2 are CUDA-only and are not available with the Windows ROCm/XPU profiles."
                 .to_string(),
         );
     }
@@ -2605,6 +2858,38 @@ fn run_comfyui_install(
             Some(&install_root),
             2,
         )?;
+        if let Some((latest_tag, latest_version)) = git_latest_release_tag(&comfy_dir) {
+            if let Err(err) = run_command_with_retry(
+                "git",
+                &["checkout", "-B", "master", &latest_tag],
+                Some(&comfy_dir),
+                1,
+            ) {
+                emit_install_event(
+                    app,
+                    "warn",
+                    &format!(
+                        "ComfyUI cloned, but failed to pin to release tag {} (v{}): {}",
+                        latest_tag, latest_version, err
+                    ),
+                );
+            } else {
+                emit_install_event(
+                    app,
+                    "info",
+                    &format!(
+                        "Pinned fresh ComfyUI install to latest release tag {} (v{}).",
+                        latest_tag, latest_version
+                    ),
+                );
+            }
+        } else {
+            emit_install_event(
+                app,
+                "warn",
+                "ComfyUI cloned, but latest release tag could not be resolved during install.",
+            );
+        }
         summary.push(InstallSummaryItem {
             name: "ComfyUI core".to_string(),
             status: "ok".to_string(),
@@ -2695,6 +2980,13 @@ fn run_comfyui_install(
             &comfy_dir,
             &python_store_s,
         )?;
+    } else if is_xpu_profile(&selected_profile) {
+        install_windows_xpu_torch_stack(
+            &uv_bin,
+            &py_exe.to_string_lossy(),
+            &comfy_dir,
+            &python_store_s,
+        )?;
     } else {
         run_uv_pip_strict(
             &uv_bin,
@@ -2724,7 +3016,7 @@ fn run_comfyui_install(
         Some(&comfy_dir),
         &[("UV_PYTHON_INSTALL_DIR", &python_store_s)],
     )?;
-    if is_rocm_profile(&selected_profile) {
+    if is_rocm_profile(&selected_profile) || is_xpu_profile(&selected_profile) {
         run_uv_pip_strict(
             &uv_bin,
             &py_exe.to_string_lossy(),
@@ -4482,6 +4774,13 @@ fn start_comfyui_root_impl(
             ) == root
         })
         .unwrap_or(false);
+    let effective_profile = detect_torch_profile_for_root(&root).or_else(|| {
+        if configured_root_matches {
+            settings.comfyui_torch_profile.clone()
+        } else {
+            None
+        }
+    });
     let effective_attention = {
         let configured = if configured_root_matches {
             settings.comfyui_attention_backend.clone()
@@ -4539,6 +4838,10 @@ fn start_comfyui_root_impl(
     let launch_args = comfyui_launch_args(
         settings.comfyui_listen_enabled,
         settings.comfyui_pinned_memory_enabled,
+        settings.comfyui_lowvram_enabled,
+        settings.comfyui_bf16_unet_enabled,
+        settings.comfyui_async_offload_enabled,
+        settings.comfyui_disable_smart_memory_enabled,
         effective_attention.as_deref(),
     );
     emit_comfyui_runtime_event(
@@ -4550,6 +4853,9 @@ fn start_comfyui_root_impl(
         ),
     );
     cmd.args(launch_args);
+    if let Some(profile) = effective_profile.as_deref() {
+        apply_intel_xpu_launch_env(&mut cmd, profile);
+    }
     cmd.current_dir(root);
     if nerdstats_enabled() {
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -4732,6 +5038,10 @@ struct ComfyRuntimeEvent {
 struct ComfyAddonState {
     torch_profile: Option<String>,
     listen_enabled: bool,
+    lowvram_enabled: bool,
+    bf16_unet_enabled: bool,
+    async_offload_enabled: bool,
+    disable_smart_memory_enabled: bool,
     launch_sage_attention: bool,
     launch_sage_attention3: bool,
     launch_flash_attention: bool,
@@ -5156,6 +5466,11 @@ fn get_comfyui_addon_state(
             }
         }),
         listen_enabled: same_as_configured_root && settings.comfyui_listen_enabled,
+        lowvram_enabled: same_as_configured_root && settings.comfyui_lowvram_enabled,
+        bf16_unet_enabled: same_as_configured_root && settings.comfyui_bf16_unet_enabled,
+        async_offload_enabled: same_as_configured_root && settings.comfyui_async_offload_enabled,
+        disable_smart_memory_enabled: same_as_configured_root
+            && settings.comfyui_disable_smart_memory_enabled,
         launch_sage_attention: launch_attention.as_deref() == Some("sage"),
         launch_sage_attention3: launch_attention.as_deref() == Some("sage3"),
         launch_flash_attention: launch_attention.as_deref() == Some("flash"),
@@ -5223,9 +5538,9 @@ fn apply_attention_backend_change(
     if !matches!(target.as_str(), "none" | "sage" | "sage3" | "flash" | "nunchaku") {
         return Err("Unknown attention backend target.".to_string());
     }
-    if is_rocm_profile(&profile) && target != "none" {
+    if is_non_cuda_profile(&profile) && target != "none" {
         return Err(
-            "SageAttention, SageAttention3, FlashAttention, and Nunchaku are CUDA-only and are not available with the Windows ROCm profile."
+            "SageAttention, SageAttention3, FlashAttention, and Nunchaku are CUDA-only and are not available with the Windows ROCm/XPU profiles."
                 .to_string(),
         );
     }
@@ -5393,9 +5708,15 @@ fn set_comfyui_launch_attention_backend(
     if !matches!(target.as_str(), "none" | "sage" | "sage3" | "flash") {
         return Err("Unknown launch attention backend target.".to_string());
     }
-    if detect_torch_profile_for_root(&root).as_deref() == Some("torch291_rocm72") && target != "none" {
+    if detect_torch_profile_for_root(&root)
+        .as_deref()
+        .map(is_non_cuda_profile)
+        .unwrap_or(false)
+        && target != "none"
+    {
         return Err(
-            "CUDA-only launch flags are not available with the Windows ROCm profile.".to_string(),
+            "CUDA-only launch flags are not available with the Windows ROCm/XPU profiles."
+                .to_string(),
         );
     }
 
@@ -5960,21 +6281,22 @@ async fn apply_comfyui_component_toggle(
     request: ComfyComponentToggleRequest,
 ) -> Result<String, String> {
     let was_running = stop_comfyui_for_mutation(&app, &state)?;
-    let root = resolve_root_path(&state.context, request.comfyui_root)?;
-    let py_path = {
-        let probe = python_for_root(&root);
-        probe.get_program().to_string_lossy().to_string()
-    };
-    let py_exe = PathBuf::from(&py_path);
-    let _ = kill_python_processes_for_root(&root, &py_exe);
-    let shared_runtime_root = state.context.config.cache_path().join("comfyui-runtime");
-    let uv_bin = resolve_uv_binary(&shared_runtime_root, &app)?;
-    let uv_python_install_dir = shared_runtime_root.join(".python").to_string_lossy().to_string();
     let component = request.component.trim().to_ascii_lowercase();
 
     let result = if matches!(
         component.as_str(),
-        "addon_pinned_memory" | "pinned_memory" | "launch_listen" | "addon_launch_listen"
+        "addon_pinned_memory"
+            | "pinned_memory"
+            | "launch_listen"
+            | "addon_launch_listen"
+            | "launch_lowvram"
+            | "addon_launch_lowvram"
+            | "launch_bf16_unet"
+            | "addon_launch_bf16_unet"
+            | "launch_async_offload"
+            | "addon_launch_async_offload"
+            | "launch_disable_smart_memory"
+            | "addon_launch_disable_smart_memory"
     ) {
         match component.as_str() {
             "addon_pinned_memory" | "pinned_memory" => {
@@ -6003,9 +6325,71 @@ async fn apply_comfyui_component_toggle(
                     Ok("ComfyUI will start without --listen.".to_string())
                 }
             }
+            "launch_lowvram" | "addon_launch_lowvram" => {
+                let enabled = request.enabled;
+                state
+                    .context
+                    .config
+                    .update_settings(|settings| settings.comfyui_lowvram_enabled = enabled)
+                    .map_err(|err| err.to_string())?;
+                if enabled {
+                    Ok("ComfyUI will start with --lowvram enabled.".to_string())
+                } else {
+                    Ok("ComfyUI will start without --lowvram.".to_string())
+                }
+            }
+            "launch_bf16_unet" | "addon_launch_bf16_unet" => {
+                let enabled = request.enabled;
+                state
+                    .context
+                    .config
+                    .update_settings(|settings| settings.comfyui_bf16_unet_enabled = enabled)
+                    .map_err(|err| err.to_string())?;
+                if enabled {
+                    Ok("ComfyUI will start with --bf16-unet enabled.".to_string())
+                } else {
+                    Ok("ComfyUI will start without --bf16-unet.".to_string())
+                }
+            }
+            "launch_async_offload" | "addon_launch_async_offload" => {
+                let enabled = request.enabled;
+                state
+                    .context
+                    .config
+                    .update_settings(|settings| settings.comfyui_async_offload_enabled = enabled)
+                    .map_err(|err| err.to_string())?;
+                if enabled {
+                    Ok("ComfyUI will start with --async-offload enabled.".to_string())
+                } else {
+                    Ok("ComfyUI will start without --async-offload.".to_string())
+                }
+            }
+            "launch_disable_smart_memory" | "addon_launch_disable_smart_memory" => {
+                let enabled = request.enabled;
+                state
+                    .context
+                    .config
+                    .update_settings(|settings| settings.comfyui_disable_smart_memory_enabled = enabled)
+                    .map_err(|err| err.to_string())?;
+                if enabled {
+                    Ok("ComfyUI will start with --disable-smart-memory enabled.".to_string())
+                } else {
+                    Ok("ComfyUI will start without --disable-smart-memory.".to_string())
+                }
+            }
             _ => Err("Unknown component toggle target.".to_string()),
         }
     } else {
+        let root = resolve_root_path(&state.context, request.comfyui_root)?;
+        let py_path = {
+            let probe = python_for_root(&root);
+            probe.get_program().to_string_lossy().to_string()
+        };
+        let py_exe = PathBuf::from(&py_path);
+        let _ = kill_python_processes_for_root(&root, &py_exe);
+        let shared_runtime_root = state.context.config.cache_path().join("comfyui-runtime");
+        let uv_bin = resolve_uv_binary(&shared_runtime_root, &app)?;
+        let uv_python_install_dir = shared_runtime_root.join(".python").to_string_lossy().to_string();
         let app_clone = app.clone();
         let root_clone = root.clone();
         let py_path_clone = py_path.clone();
@@ -6020,7 +6404,7 @@ async fn apply_comfyui_component_toggle(
                 .clone()
                 .or_else(|| detect_torch_profile_for_root(&root_clone))
                 .unwrap_or_default();
-            if is_rocm_profile(&resolved_profile)
+            if is_non_cuda_profile(&resolved_profile)
                 && matches!(
                     component_clone.as_str(),
                     "addon_sageattention"
@@ -6036,7 +6420,7 @@ async fn apply_comfyui_component_toggle(
                 )
             {
                 return Err(
-                    "SageAttention, SageAttention3, FlashAttention, Nunchaku, and Trellis2 are CUDA-only and are not available with the Windows ROCm profile."
+                    "SageAttention, SageAttention3, FlashAttention, Nunchaku, and Trellis2 are CUDA-only and are not available with the Windows ROCm/XPU profiles."
                         .to_string(),
                 );
             }
@@ -6655,11 +7039,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let nerdstats = args.iter().any(|arg| arg.eq_ignore_ascii_case("--nerdstats"));
     let fakeamd = args.iter().any(|arg| arg.eq_ignore_ascii_case("--fakeamd"));
+    let fakeintel = args.iter().any(|arg| arg.eq_ignore_ascii_case("--fakeintel"));
     if nerdstats {
         std::env::set_var("ARCTIC_NERDSTATS", "1");
     }
     if fakeamd {
         std::env::set_var("ARCTIC_FAKE_AMD", "1");
+    }
+    if fakeintel {
+        std::env::set_var("ARCTIC_FAKE_INTEL", "1");
     }
     if nerdstats {
         try_attach_parent_console();
@@ -6678,6 +7066,9 @@ fn main() {
     }
     if fakeamd {
         log::info!("Fake AMD mode enabled (Windows UI/profile simulation).");
+    }
+    if fakeintel {
+        log::info!("Fake Intel mode enabled (Windows UI/profile simulation).");
     }
 
     let context = match build_context() {
