@@ -3565,6 +3565,18 @@ fn set_comfyui_install_base(
 }
 
 #[tauri::command]
+fn save_comfyui_extra_args(
+    state: State<'_, AppState>,
+    value: String,
+) -> Result<AppSettings, String> {
+    state
+        .context
+        .config
+        .update_settings(|settings| settings.comfyui_extra_args = value)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 fn get_comfyui_extra_model_config(
     state: State<'_, AppState>,
     comfyui_root: Option<String>,
@@ -3635,6 +3647,74 @@ fn save_civitai_token(state: State<'_, AppState>, token: String) -> Result<AppSe
             };
         })
         .map_err(|err| err.to_string())
+}
+
+fn parse_comfyui_extra_args(raw: &str) -> Result<Vec<String>, String> {
+    let mut args: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(q) => match ch {
+                '\\' if q == '"' => {
+                    let Some(next) = chars.next() else {
+                        return Err("Extra args end with a dangling escape inside quotes.".to_string());
+                    };
+                    current.push(next);
+                }
+                c if c == q => quote = None,
+                _ => current.push(ch),
+            },
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => match chars.peek().copied() {
+                    Some('\n') => {
+                        chars.next();
+                    }
+                    Some('\r') => {
+                        chars.next();
+                        if matches!(chars.peek(), Some('\n')) {
+                            chars.next();
+                        }
+                    }
+                    Some(next) => {
+                        current.push(next);
+                        chars.next();
+                    }
+                    None => return Err("Extra args end with a dangling escape.".to_string()),
+                },
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        args.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if quote.is_some() {
+        return Err("Extra args contain an unterminated quoted string.".to_string());
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    Ok(args)
+}
+
+fn format_cli_debug_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        "\"\"".to_string()
+    } else if arg
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch == '"' || ch == '\\')
+    {
+        format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        arg.to_string()
+    }
 }
 
 #[tauri::command]
@@ -4844,6 +4924,7 @@ fn start_comfyui_root_impl(
         settings.comfyui_disable_smart_memory_enabled,
         effective_attention.as_deref(),
     );
+    let extra_args = parse_comfyui_extra_args(&settings.comfyui_extra_args)?;
     emit_comfyui_runtime_event(
         app,
         "launch_args",
@@ -4852,7 +4933,33 @@ fn start_comfyui_root_impl(
             effective_attention.as_deref().unwrap_or("PyTorch attention")
         ),
     );
+    if !extra_args.is_empty() {
+        emit_comfyui_runtime_event(
+            app,
+            "launch_args",
+            format!("Appending extra args: {}", extra_args.join(" ")),
+        );
+    }
+    let debug_args: Vec<String> = std::iter::once("-W".to_string())
+        .chain(std::iter::once("ignore::FutureWarning".to_string()))
+        .chain(std::iter::once(main_py.to_string_lossy().to_string()))
+        .chain(launch_args.iter().cloned())
+        .chain(extra_args.iter().cloned())
+        .collect();
+    if nerdstats_enabled() {
+        log::info!(
+            "ComfyUI launch command: {} {}",
+            format_cli_debug_arg(&py_exe.to_string_lossy()),
+            debug_args
+                .iter()
+                .map(|arg| format_cli_debug_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        log::info!("ComfyUI launch cwd: {}", root.display());
+    }
     cmd.args(launch_args);
+    cmd.args(extra_args);
     if let Some(profile) = effective_profile.as_deref() {
         apply_intel_xpu_launch_env(&mut cmd, profile);
     }
@@ -7128,6 +7235,7 @@ fn main() {
             set_hf_xet_enabled,
             set_comfyui_root,
             set_comfyui_install_base,
+            save_comfyui_extra_args,
             get_comfyui_extra_model_config,
             set_comfyui_extra_model_config,
             save_civitai_token,
@@ -7150,11 +7258,6 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");
 }
-
-
-
-
-
 
 
 

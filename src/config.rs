@@ -11,6 +11,7 @@ use std::{
 const SETTINGS_FILE: &str = "settings.json";
 const FALLBACK_REMOTE_CATALOG_URL: &str =
     "https://raw.githubusercontent.com/ArcticLatent/Arctic-Helper/refs/heads/main/assets/catalog.json";
+const DEFAULT_COMFYUI_EXTRA_ARGS: &str = "--listen 0.0.0.0 \\\n--port 8188 \\\n--max-upload-size 10 \\\n--extra-model-paths-config /mnt/AI/COMFY/extra_model_paths.yaml \\\n--user-directory /mnt/AI/COMFY/USER \\\n--input-directory /mnt/AI/COMFY/INPUT/ \\\n--output-directory /mnt/AI/COMFY/OUTPUT \\\n--temp-directory /mnt/AI/COMFY/TEMP \\\n--enable-cors-header http://172.16.10.2:8188 \\\n--verbose INFO";
 
 #[derive(Debug)]
 pub struct ConfigStore {
@@ -145,6 +146,8 @@ pub struct AppSettings {
     pub comfyui_async_offload_enabled: bool,
     #[serde(default)]
     pub comfyui_disable_smart_memory_enabled: bool,
+    #[serde(default = "default_comfyui_extra_args")]
+    pub comfyui_extra_args: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comfyui_attention_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,6 +187,7 @@ impl Default for AppSettings {
             comfyui_bf16_unet_enabled: false,
             comfyui_async_offload_enabled: false,
             comfyui_disable_smart_memory_enabled: false,
+            comfyui_extra_args: default_comfyui_extra_args(),
             comfyui_attention_backend: None,
             comfyui_torch_profile: None,
             hf_xet_enabled: false,
@@ -199,4 +203,8 @@ pub(crate) fn default_catalog_endpoint() -> Option<String> {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_comfyui_extra_args() -> String {
+    DEFAULT_COMFYUI_EXTRA_ARGS.to_string()
 }
