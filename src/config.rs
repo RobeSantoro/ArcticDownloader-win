@@ -11,7 +11,7 @@ use std::{
 const SETTINGS_FILE: &str = "settings.json";
 const FALLBACK_REMOTE_CATALOG_URL: &str =
     "https://raw.githubusercontent.com/ArcticLatent/Arctic-Helper/refs/heads/main/assets/catalog.json";
-const DEFAULT_COMFYUI_EXTRA_ARGS: &str = "--listen 0.0.0.0 \\\n--port 8188 \\\n--max-upload-size 10 \\\n--extra-model-paths-config /mnt/AI/COMFY/extra_model_paths.yaml \\\n--user-directory /mnt/AI/COMFY/USER \\\n--input-directory /mnt/AI/COMFY/INPUT/ \\\n--output-directory /mnt/AI/COMFY/OUTPUT \\\n--temp-directory /mnt/AI/COMFY/TEMP \\\n--enable-cors-header http://172.16.10.2:8188 \\\n--verbose INFO";
+const DEFAULT_COMFYUI_EXTRA_ARGS: &str = "--listen 0.0.0.0 \\\n--port 8188 \\\n--max-upload-size 10 \\\n--extra-model-paths-config E:\\COMFY\\extra_model_paths.yaml \\\n--user-directory E:\\COMFY\\USER \\\n--input-directory E:\\COMFY\\INPUT \\\n--output-directory E:\\COMFY\\OUTPUT \\\n--temp-directory E:\\COMFY\\TEMP \\\n--enable-cors-header http://172.16.10.2:8188 \\\n--verbose INFO";
 
 #[derive(Debug)]
 pub struct ConfigStore {
